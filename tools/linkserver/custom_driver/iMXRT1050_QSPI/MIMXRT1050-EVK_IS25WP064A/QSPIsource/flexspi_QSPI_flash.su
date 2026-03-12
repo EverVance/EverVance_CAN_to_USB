@@ -1,0 +1,7 @@
+../QSPIsource/flexspi_QSPI_flash.c:153:10:flexspi_nor_write_enable	24	static
+../QSPIsource/flexspi_QSPI_flash.c:170:10:flexspi_nor_wait_bus_busy	32	static
+../QSPIsource/flexspi_QSPI_flash.c:228:10:flexspi_nor_enable_quad_mode	32	static
+../QSPIsource/flexspi_QSPI_flash.c:262:10:flexspi_nor_flash_erase_sector	32	static
+../QSPIsource/flexspi_QSPI_flash.c:298:10:flexspi_nor_flash_page_program	40	static
+../QSPIsource/flexspi_QSPI_flash.c:331:10:flexspi_nor_get_vendor_id	32	static
+../QSPIsource/flexspi_QSPI_flash.c:350:5:QSPI_init	64	static

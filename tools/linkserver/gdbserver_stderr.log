@@ -1,0 +1,60 @@
+INFO: Selected device MIMXRT1062xxxxB:VBA_CAN_RT1062_MX25L3233_customcfx_safe
+INFO: Redlinkserv listening on extra ports: 3330
+INFO: Getting available probes
+INFO: Selecting probe by index
+INFO: Selected probe #1 KRA4BLPRI1Q2F (MCU-LINK Pro (r1EF) CMSIS-DAP V3.160)
+INFO: MCU-Link firmware update `check`: Probe ([KRA4BLPRI1Q2F] [MCU-LINK Pro (r1EF) CMSIS-DAP V3.160]) is already running the same firmware version as the included firmware version [3.160]
+INFO: [stub (3333)] Ns: LinkServer RedlinkMulti Driver v25.6 (Jun 26 2025 19:34:05 - crt_emu_cm_redlink.exe build 1017)
+INFO: Connected to core cm7
+INFO: [stub (3333)] Pc: (  0) Reading remote configuration
+INFO: Disconnected from core cm7
+INFO: [stub (3333)] Wc(03). No cache support.
+INFO: [stub (3333)] Nc: Found generic directory XML file in C:\Users\YANSHE~1.ZHA\AppData\Local\Temp\tmp3kyx94ce\crt_directory.xml
+INFO: [stub (3333)] Pc: (  5) Remote configuration complete
+INFO: [stub (3333)] Nc: Reconnected to existing LinkServer process.
+INFO: [stub (3333)] Wc: ============= SCRIPT: RT1060_connect.scp =============
+Wc: RT1060 Connect Script
+Wc: DpID = 0BD11477
+Wc: APID = 0x04770041
+Wc: Disabling MPU
+Wc: Configure FlexRAM for 768KB OC RAM, 128KB I-TCM, 128KB D-TCM
+Wc: Finished
+Wc: ============= END SCRIPT =============================
+INFO: [stub (3333)] Nc: Probe Firmware: MCU-LINK Pro (r1EF) CMSIS-DAP V3.160 (NXP Semiconductors)
+Nc: Serial Number:  KRA4BLPRI1Q2F
+Nc: VID:PID:  1FC9:0143
+Nc: USB Path: 0005:001a:00
+INFO: [stub (3333)] Nc: Using memory from core 0 after searching for a good core
+INFO: [stub (3333)] Nc: On debug connection - reset using system reset
+INFO: [stub (3333)] Pc: ( 30) Emulator Connected
+INFO: [stub (3333)] Pc: ( 40) Debug Halt
+INFO: [stub (3333)] Pc: ( 50) CPU ID
+INFO: [stub (3333)] Nc: debug interface type      = CoreSight DP (DAP DP ID 0BD11477) over SWD TAP 0
+Nc: processor type            = Cortex-M7 (CPU ID 00000C27) on DAP AP 0
+INFO: [stub (3333)] Nc: number of h/w breakpoints = 8
+Nc: number of flash patches   = 0
+INFO: [stub (3333)] Nc: number of h/w watchpoints = 4
+Nc: Probe(0): Connected&Reset. DpID: 0BD11477. CpuID: 00000C27. Info: <None>
+INFO: [stub (3333)] Nc: Debug protocol: SWD. RTCK: Disabled. Vector catch: Enabled.
+Ns: Content of CoreSight Debug ROM(s):
+INFO: [stub (3333)] Nc: RBASE E00FD000: CID B105100D PID 000008E88C ROM (type 0x1)
+INFO: [stub (3333)] Nc: ROM 1 E00FE000: CID B105100D PID 04000BB4C8 ROM (type 0x1)
+INFO: [stub (3333)] Nc: ROM 2 E00FF000: CID B105100D PID 04000BB4C7 ROM (type 0x1)
+INFO: [stub (3333)] Nc: ROM 3 E000E000: CID B105E00D PID 04000BB00C Gen SCS (type 0x0)
+INFO: [stub (3333)] Nc: ROM 3 E0001000: CID B105E00D PID 04000BB002 Gen DWT (type 0x0)
+INFO: [stub (3333)] Nc: ROM 3 E0002000: CID B105E00D PID 04000BB00E Gen (type 0x0)
+INFO: [stub (3333)] Nc: ROM 3 E0000000: CID B105E00D PID 04000BB001 Gen ITM (type 0x0)
+INFO: [stub (3333)] Nc: ROM 2 E0041000: CID B105900D PID 04001BB975 CSt ARM ETMv4.0 type 0x13 Trace Source - Core
+INFO: [stub (3333)] Nc: ROM 2 E0042000: CID B105900D PID 04004BB906 CSt type 0x14 Debug Control - Trigger, e.g. ECT
+INFO: [stub (3333)] Nc: ROM 1 E0040000: CID B105900D PID 04000BB9A9 CSt type 0x11 Trace Sink - TPIU
+INFO: [stub (3333)] Nc: ROM 1 E0043000: CID B105F00D PID 04001BB101 Sys (type 0x0)
+INFO: [stub (3333)] Nc: NXP: MIMXRT1062xxxxB
+INFO: [stub (3333)] Nc: DAP stride is 1024 bytes (256 words)
+INFO: [stub (3333)] Nc: Inspected v.2 External Flash Device on SPI RT1062_MX25L3233_4K.cfx
+Nc: Image 'MIMXRT1050-EVK_IS25WP064A Mar  9 2026 22:27:10'
+INFO: [stub (3333)] Pc: ( 65) Chip Setup Complete
+Pc: ( 70) License Check Complete
+Ns: Awaiting telnet connection to port 14444 ...
+INFO: [stub (3333)] Pc: ( 85) Registered Semihost Handler
+Pc: (100) Target Ready
+Wc: GDB stub (F:\LinkServer_25.6.131\binaries\crt_emu_cm_redlink.exe) terminating - GDB protocol problem: Pipe has been closed by GDB.

@@ -1,0 +1,57 @@
+{
+  "copyright": "Copyright 2026 NXP",
+  "license": "SPDX-License-Identifier: BSD-3-Clause",
+  "version": "1.1.0",
+  "vendor": "NXP",
+  "devices": [
+    {
+      "board": "VBA_CAN_RT1062_MX25L3233_customcfx",
+      "device": {
+        "id": "MIMXRT1062xxxxB",
+        "name": "MIMXRT1062B",
+        "family": "MIMXRT1060",
+        "memory": [
+          {
+            "location": "0x20000000",
+            "size": "0x00020000",
+            "type": "RAM"
+          },
+          {
+            "location": "0x00000000",
+            "size": "0x00020000",
+            "type": "RAM"
+          },
+          {
+            "location": "0x20200000",
+            "size": "0x00080000",
+            "type": "RAM"
+          },
+          {
+            "location": "0x20280000",
+            "size": "0x00040000",
+            "type": "RAM"
+          },
+          {
+            "location": "0x60000000",
+            "size": "0x00400000",
+            "type": "ExtFlash",
+            "flash-driver": "RT1062_MX25L3233_4K.cfx"
+          }
+        ],
+        "cores": [
+          {
+            "type": "cm7",
+            "name": "cm7"
+          }
+        ]
+      },
+      "debug": {
+        "no-packed": true,
+        "protocol": "swd",
+        "swo": true,
+        "wirespeed": 12000000,
+        "connect-script": "RT1060_connect.scp"
+      }
+    }
+  ]
+}

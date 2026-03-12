@@ -1,0 +1,17 @@
+../drivers/fsl_flexspi.h:650:20:FLEXSPI_GetBusIdleStatus	0	static
+../drivers/fsl_flexspi.c:121:10:FLEXSPI_GetInstance	0	static
+../drivers/fsl_flexspi.c:193:10:FLEXSPI_CheckAndClearError	0	static
+../drivers/fsl_flexspi.c:230:6:FLEXSPI_Init	12	static
+../drivers/fsl_flexspi.c:286:6:FLEXSPI_GetDefaultConfig	16	static
+../drivers/fsl_flexspi.c:311:6:FLEXSPI_Deinit	0	static
+../drivers/fsl_flexspi.c:317:6:FLEXSPI_SetFlashConfig	24	static
+../drivers/fsl_flexspi.c:388:6:FLEXSPI_UpdateLUT	16	static
+../drivers/fsl_flexspi.c:415:10:FLEXSPI_WriteBlocking	24	static
+../drivers/fsl_flexspi.c:463:10:FLEXSPI_ReadBlocking	24	static
+../drivers/fsl_flexspi.c:533:10:FLEXSPI_TransferBlocking	16	static
+../drivers/fsl_flexspi.c:590:6:FLEXSPI_TransferCreateHandle	24	static
+../drivers/fsl_flexspi.c:613:10:FLEXSPI_TransferNonBlocking	20	static
+../drivers/fsl_flexspi.c:679:10:FLEXSPI_TransferGetCount	0	static
+../drivers/fsl_flexspi.c:697:6:FLEXSPI_TransferAbort	0	static
+../drivers/fsl_flexspi.c:705:6:FLEXSPI_TransferHandleIRQ	24	static
+../drivers/fsl_flexspi.c:801:6:FLEXSPI_DriverIRQHandler	0	static

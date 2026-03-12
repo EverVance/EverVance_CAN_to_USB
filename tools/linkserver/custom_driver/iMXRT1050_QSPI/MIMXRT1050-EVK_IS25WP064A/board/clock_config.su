@@ -1,0 +1,3 @@
+F:\AS\NXP_Workspace\VBA_CAN\tools\linkserver\custom_driver\iMXRT1050_QSPI\drivers/fsl_clock.h:801:20:CLOCK_SetMux	12	static
+../board/clock_config.c:162:6:BOARD_BootClockRUN	8	static
+../board/clock_config.c:72:6:BOARD_InitBootClocks	0	static

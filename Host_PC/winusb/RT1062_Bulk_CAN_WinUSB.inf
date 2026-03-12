@@ -1,0 +1,48 @@
+;
+; RT1062 Bulk CAN WinUSB binding file
+;
+
+[Version]
+Signature="$Windows NT$"
+Class=USBDevice
+ClassGuid={88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+Provider=%MFGNAME%
+DriverVer=03/11/2026,1.0.0.0
+
+[Manufacturer]
+%MFGNAME%=DeviceList,NTamd64
+
+[DestinationDirs]
+DefaultDestDir=12
+
+[DriverInstall.NT]
+Include=winusb.inf
+Needs=WINUSB.NT
+
+[DriverInstall.NT.Services]
+Include=winusb.inf
+AddService=WinUSB,0x00000002,WinUSB_ServiceInstall
+
+[WinUSB_ServiceInstall]
+DisplayName=%WinUSB_SvcDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WinUSB.sys
+
+[DriverInstall.NT.HW]
+AddReg=Dev_AddReg
+
+[Dev_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{620ABCCC-9C28-4D68-AA56-D7F27DE4B306}"
+
+[DeviceList]
+%DESCRIPTION%=DriverInstall.NT, USB\VID_1FC9&PID_0135
+
+[DeviceList.NTamd64]
+%DESCRIPTION%=DriverInstall.NT, USB\VID_1FC9&PID_0135
+
+[Strings]
+MFGNAME="VBA_CAN"
+DESCRIPTION="RT1062 Bulk CAN"
+WinUSB_SvcDesc="WinUSB Driver"

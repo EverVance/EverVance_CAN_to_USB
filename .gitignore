@@ -1,0 +1,29 @@
+# IDE and user-local state
+.metadata/
+.vscode/
+.mcuxpressoide_packages_support/
+*.launch
+
+# Build output
+out/
+Bootloader/Debug/
+Bootloader/Release/
+CAN_APP/Debug/
+CAN_APP/Release/
+**/bin/
+**/obj/
+**/Debug/
+**/Release/
+
+# Logs and generated captures
+Host_PC/logs/
+*.buslog.csv
+
+# Archives and packaged drops
+*.zip
+*.7z
+*.rar
+
+# OS noise
+Thumbs.db
+Desktop.ini

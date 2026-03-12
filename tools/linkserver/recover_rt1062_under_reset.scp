@@ -1,0 +1,40 @@
+1 REM ======================================
+2 REM RT1062 recover-under-reset helper
+3 REM Attempts to initialize SWD/AP while reset is asserted.
+4 REM ======================================
+
+10 p% = probefirstfound
+20 print "Probe index = "; p%
+30 wiresetspeed p% 200000
+35 wiresetidlecycles p% 8
+40 print "Asserting RESET low"
+50 wireholdreset p% 0
+60 wait 50
+70 d% = wireswdconnect p%
+80 print "SWD DPID = "; ~d%
+90 selectprobecore p% 0
+100 print "Releasing RESET"
+110 wireholdreset p% 1
+120 wait 5
+130 print "Attempt 1"
+140 cminitapdp this
+150 cmclearerrors this
+160 cmresetvectorcatchset this
+170 cmhalt this
+180 wait 10
+190 print "Attempt 2"
+200 cminitapdp this
+210 cmclearerrors this
+220 cmresetvectorcatchset this
+230 cmhalt this
+240 wait 10
+250 print "Attempt 3"
+260 cminitapdp this
+270 cmclearerrors this
+280 cmresetvectorcatchset this
+290 cmhalt this
+300 print "Debug status after attempts:"
+310 cmdebugstatus this
+320 print "Core registers:"
+330 cmregs this
+340 end

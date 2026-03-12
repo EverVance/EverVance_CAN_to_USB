@@ -1,0 +1,87 @@
+1 REM ======================================
+2 REM RT1062 boot chain debug
+3 REM Break on bootloader/app key addresses and dump PC/SP/VTOR/GPIO2 state.
+4 REM ======================================
+
+10 p% = probefirstfound
+20 print "Probe index = "; p%
+30 wiresetspeed p% 1000000
+40 wiresetidlecycles p% 8
+50 wireholdreset p% 0
+60 wait 50
+70 a% = wireswdconnect p%
+80 print "SWD DPID = "; ~a%
+90 selectprobecore p% 0
+100 wireholdreset p% 1
+110 wait 5
+120 cminitapdp this
+130 cmclearerrors this
+140 cmhalt this
+150 print "Disabling MPU"
+160 a% = peek32 this 0xE000ED94
+170 a% = a% & 0xFFFFFFFE
+180 poke32 this 0xE000ED94 a%
+190 print "Configure FlexRAM"
+200 poke32 this 0x400B0000 0x4
+210 poke32 this 0x400AC044 0x5555FFAA
+220 poke32 this 0x400AC040 0x200007
+
+230 print "Phase 1: break at JumpToApp"
+240 cmbreakset this 0x60008B39
+250 cmresetvectorcatchclear this
+260 cmsysresetreq this
+270 wait 100
+280 cmhalt this
+290 cmdebugstatus this
+300 cmregs this
+310 a% = peek32 this 0xE000ED08
+320 b% = peek32 this 0xE000ED28
+330 c% = peek32 this 0xE000ED2C
+340 print "VTOR = "; ~a%
+350 print "CFSR = "; ~b%
+360 print "HFSR = "; ~c%
+
+370 print "Phase 2: break in APP"
+380 cmbreakclear this 0x60008B39
+390 cmbreakset this 0x600406B5
+400 cmbreakset this 0x60035E91
+410 cmbreakset this 0x60036871
+420 cmbreakset this 0x60036609
+430 cmrun this
+440 wait 100
+450 cmhalt this
+460 cmdebugstatus this
+470 cmregs this
+480 a% = peek32 this 0xE000ED08
+490 b% = peek32 this 0xE000ED28
+500 c% = peek32 this 0xE000ED2C
+510 d% = peek32 this 0x401BC000
+520 e% = peek32 this 0x401BC004
+530 f% = peek32 this 0x60022000
+540 g% = peek32 this 0x60022004
+550 print "VTOR = "; ~a%
+560 print "CFSR = "; ~b%
+570 print "HFSR = "; ~c%
+580 print "GPIO2_DR = "; ~d%
+590 print "GPIO2_GDIR = "; ~e%
+600 print "APP_SP = "; ~f%
+610 print "APP_RESET = "; ~g%
+
+620 print "Phase 3: continue deeper into APP"
+630 cmbreakclear this 0x600406B5
+640 cmbreakclear this 0x60035E91
+650 cmbreakclear this 0x60036871
+660 cmbreakclear this 0x60036609
+670 cmbreakset this 0x60035E91
+680 cmbreakset this 0x60036871
+690 cmbreakset this 0x60036609
+700 cmrun this
+710 wait 100
+720 cmhalt this
+730 cmdebugstatus this
+740 cmregs this
+750 a% = peek32 this 0x401BC000
+760 b% = peek32 this 0x401BC004
+770 print "GPIO2_DR = "; ~a%
+780 print "GPIO2_GDIR = "; ~b%
+790 end

@@ -1,0 +1,80 @@
+1 REM ======================================
+2 REM RT1062 boot chain sampling
+3 REM Recover under reset, then run in short windows and sample PC/SP/VTOR/GPIO.
+4 REM ======================================
+
+10 p% = probefirstfound
+20 print "Probe index = "; p%
+30 wiresetspeed p% 1000000
+40 wiresetidlecycles p% 8
+50 wireholdreset p% 0
+60 wait 50
+70 a% = wireswdconnect p%
+80 print "SWD DPID = "; ~a%
+90 selectprobecore p% 0
+100 wireholdreset p% 1
+110 wait 5
+120 print "Recover 1"
+130 cminitapdp this
+140 cmclearerrors this
+150 cmresetvectorcatchset this
+160 cmhalt this
+170 wait 10
+180 print "Recover 2"
+190 cminitapdp this
+200 cmclearerrors this
+210 cmresetvectorcatchset this
+220 cmhalt this
+230 wait 10
+
+240 print "Sample 0"
+250 cmdebugstatus this
+260 cmregs this
+270 a% = peek32 this 0xE000ED08
+280 b% = peek32 this 0xE000ED28
+290 c% = peek32 this 0xE000ED2C
+300 print "VTOR = "; ~a%
+310 print "CFSR = "; ~b%
+320 print "HFSR = "; ~c%
+
+330 print "Run 20ms"
+340 cmresetvectorcatchclear this
+350 cmrun this
+360 wait 20
+370 cmhalt this
+380 print "Sample 1"
+390 cmdebugstatus this
+400 cmregs this
+410 a% = peek32 this 0xE000ED08
+420 b% = peek32 this 0xE000ED28
+430 c% = peek32 this 0xE000ED2C
+440 d% = peek32 this 0x401BC000
+450 e% = peek32 this 0x401BC004
+460 print "VTOR = "; ~a%
+470 print "CFSR = "; ~b%
+480 print "HFSR = "; ~c%
+490 print "GPIO2_DR = "; ~d%
+500 print "GPIO2_GDIR = "; ~e%
+
+510 print "Run 100ms"
+520 cmrun this
+530 wait 100
+540 cmhalt this
+550 print "Sample 2"
+560 cmdebugstatus this
+570 cmregs this
+580 a% = peek32 this 0xE000ED08
+590 b% = peek32 this 0xE000ED28
+600 c% = peek32 this 0xE000ED2C
+610 d% = peek32 this 0x401BC000
+620 e% = peek32 this 0x401BC004
+630 f% = peek32 this 0x60022000
+640 g% = peek32 this 0x60022004
+650 print "VTOR = "; ~a%
+660 print "CFSR = "; ~b%
+670 print "HFSR = "; ~c%
+680 print "GPIO2_DR = "; ~d%
+690 print "GPIO2_GDIR = "; ~e%
+700 print "APP_SP = "; ~f%
+710 print "APP_RESET = "; ~g%
+720 end

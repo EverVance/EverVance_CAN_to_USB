@@ -1,0 +1,3 @@
+../utilities/fsl_str.c:142:17:ScanIgnoreWhiteSpace	0	static
+../utilities/fsl_str.c:363:5:StrFormatPrintf	88	static
+../utilities/fsl_str.c:878:5:StrFormatScanf	40	static

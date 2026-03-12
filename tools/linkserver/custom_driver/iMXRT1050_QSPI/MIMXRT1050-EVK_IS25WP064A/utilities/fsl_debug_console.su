@@ -1,0 +1,8 @@
+../utilities/fsl_debug_console.c:193:13:DbgConsole_RelocateLog	32	static
+../utilities/fsl_debug_console.c:103:10:DbgConsole_Init	4	static
+../utilities/fsl_debug_console.c:111:10:DbgConsole_Deinit	8	static
+../utilities/fsl_debug_console.c:119:10:DbgConsole_Flush	0	static
+../utilities/fsl_debug_console.c:127:5:DbgConsole_Printf	152	static
+../utilities/fsl_debug_console.c:145:5:DbgConsole_Putchar	16	static
+../utilities/fsl_debug_console.c:152:5:DbgConsole_Scanf	48	static
+../utilities/fsl_debug_console.c:183:5:DbgConsole_Getchar	16	static

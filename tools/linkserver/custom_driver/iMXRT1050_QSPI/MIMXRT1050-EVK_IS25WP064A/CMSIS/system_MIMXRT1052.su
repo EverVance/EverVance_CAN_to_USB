@@ -1,0 +1,3 @@
+../CMSIS/system_MIMXRT1052.c:135:6:SystemCoreClockUpdate	16	static
+../CMSIS/system_MIMXRT1052.c:240:29:SystemInitHook	0	static
+../CMSIS/system_MIMXRT1052.c:88:6:SystemInit	16	static

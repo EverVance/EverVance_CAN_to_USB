@@ -1,0 +1,25 @@
+10 p% = probefirstfound
+20 print "Probe index = "; p%
+30 wiresetspeed p% 4000000
+40 a% = wireswdconnect p%
+50 print "SWD DPID = "; ~a%
+60 selectprobecore p% 0
+70 cminitapdp this
+80 cmclearerrors this
+90 cmhalt this
+100 print "Regs"
+110 a% = peek32 this 0x400FC01C
+120 b% = peek32 this 0x400FC038
+130 c% = peek32 this 0x40394010
+140 d% = peek32 this 0x40394014
+150 e% = peek32 this 0x40394018
+160 f% = peek32 this 0x40394058
+170 g% = peek32 this 0x4039405C
+180 print "CCM_CBCMR = "; ~a%
+190 print "CCM_CSCMR2 = "; ~b%
+200 print "LPSPI1_CR = "; ~c%
+210 print "LPSPI1_SR = "; ~d%
+220 print "LPSPI1_IER = "; ~e%
+230 print "LPSPI1_TCR = "; ~f%
+240 print "LPSPI1_CCR = "; ~g%
+250 end

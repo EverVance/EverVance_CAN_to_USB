@@ -1,0 +1,22 @@
+10 p% = probefirstfound
+20 print "Probe index = "; p%
+30 wiresetspeed p% 4000000
+40 wireholdreset p% 0
+50 wait 20
+60 a% = wireswdconnect p%
+70 print "SWD DPID = "; ~a%
+80 selectprobecore p% 0
+90 cminitapdp this
+100 cmclearerrors this
+110 cmhalt this
+120 a% = peek32 this 0x401F4460
+130 b% = peek32 this 0x401F4470
+140 c% = peek32 this 0x401F46D0
+150 d% = peek32 this 0x400F8004
+160 e% = peek32 this 0x400F801C
+170 print "OCOTP_CFG6 = "; ~a%
+180 print "OCOTP_CFG7 = "; ~b%
+190 print "OCOTP_CFG45 = "; ~c%
+200 print "SRC_SBMR1 = "; ~d%
+210 print "SRC_SBMR2 = "; ~e%
+220 end

@@ -1,0 +1,58 @@
+1 REM ======================================
+2 REM RT1062 post-reset state capture
+3 REM Recover under reset, run briefly, then halt and print CPU/GPIO state.
+4 REM ======================================
+
+10 p% = probefirstfound
+20 print "Probe index = "; p%
+30 wiresetspeed p% 200000
+40 wiresetidlecycles p% 8
+50 print "Asserting RESET low"
+60 wireholdreset p% 0
+70 wait 50
+80 a% = wireswdconnect p%
+90 print "SWD DPID = "; ~a%
+100 selectprobecore p% 0
+110 print "Releasing RESET"
+120 wireholdreset p% 1
+130 wait 5
+140 print "Recover attempt 1"
+150 cminitapdp this
+160 cmclearerrors this
+170 cmresetvectorcatchset this
+180 cmhalt this
+190 wait 10
+200 print "Recover attempt 2"
+210 cminitapdp this
+220 cmclearerrors this
+230 cmresetvectorcatchset this
+240 cmhalt this
+250 wait 10
+260 print "Running target for 150ms"
+270 cmresetvectorcatchclear this
+280 cmrun this
+290 wait 150
+300 cmhalt this
+310 print "Debug status:"
+320 cmdebugstatus this
+330 print "Core registers:"
+340 cmregs this
+350 a% = peek32 this 0xE000ED08
+360 b% = peek32 this 0xE000ED28
+370 c% = peek32 this 0xE000ED2C
+380 d% = peek32 this 0xE000ED34
+390 e% = peek32 this 0xE000ED38
+400 f% = peek32 this 0x401BC000
+410 g% = peek32 this 0x401BC004
+420 h% = peek32 this 0x60022000
+430 i% = peek32 this 0x60022004
+440 print "VTOR       = "; ~a%
+450 print "CFSR       = "; ~b%
+460 print "HFSR       = "; ~c%
+470 print "MMFAR      = "; ~d%
+480 print "BFAR       = "; ~e%
+490 print "GPIO2_DR   = "; ~f%
+500 print "GPIO2_GDIR = "; ~g%
+510 print "APP SP     = "; ~h%
+520 print "APP Reset  = "; ~i%
+530 end

@@ -1,0 +1,6 @@
+../source/FlashPrg.c:33:10:Init	8	static
+../source/FlashPrg.c:81:10:UnInit	0	static
+../source/FlashPrg.c:94:10:EraseChip	8	static
+../source/FlashPrg.c:121:10:EraseSectors	16	static
+../source/FlashPrg.c:158:10:ProgramPage	24	static
+../source/FlashPrg.c:197:10:Verify	16	static

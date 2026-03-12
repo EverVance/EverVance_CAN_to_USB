@@ -1,0 +1,7 @@
+../utilities/fsl_log.c:264:10:LOG_Init	16	static
+../utilities/fsl_log.c:293:6:LOG_Deinit	0	static
+../utilities/fsl_log.c:303:10:LOG_WaitIdle	8	static
+../utilities/fsl_log.c:329:5:LOG_Pop	8	static
+../utilities/fsl_log.c:316:5:LOG_Push	0	static
+../utilities/fsl_log.c:353:5:LOG_ReadLine	24	static
+../utilities/fsl_log.c:403:5:LOG_ReadCharacter	8	static

@@ -1,0 +1,4 @@
+Firmware update `check`: not required - forced update can be performed using: `LinkServer probe #1 update forced`
+GDB server listening on port 3333 in debug mode (core cm7)
+Semihosting server listening on port 4444 (core cm7)
+Gdbserver on port 3333 has closed

@@ -1,0 +1,27 @@
+10 p% = probefirstfound
+20 print "Probe index = "; p%
+30 wiresetspeed p% 4000000
+40 wireholdreset p% 0
+50 wait 20
+60 a% = wireswdconnect p%
+70 print "SWD DPID = "; ~a%
+80 selectprobecore p% 0
+90 cminitapdp this
+100 cmclearerrors this
+110 cmhalt this
+120 print "Boot state"
+130 a% = peek32 this 0x60000000
+140 b% = peek32 this 0x60001000
+150 c% = peek32 this 0x60002000
+160 d% = peek32 this 0x60022000
+170 e% = peek32 this 0x60022004
+180 f% = peek32 this 0x400F8004
+190 g% = peek32 this 0x400F801C
+200 print "FLASH_CFG = "; ~a%
+210 print "IVT_HDR = "; ~b%
+220 print "VECT_MSP = "; ~c%
+230 print "APP_SP = "; ~d%
+240 print "APP_RESET = "; ~e%
+250 print "SRC_SBMR1 = "; ~f%
+260 print "SRC_SBMR2 = "; ~g%
+270 end

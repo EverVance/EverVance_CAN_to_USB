@@ -1,0 +1,9 @@
+/Release/
+/Debug/
+/MinRelease/
+/MinRelease_Mass/
+/Release_SectorHashing/
+/Release_SectorHashing_ARMv8/
+/Release_BlankCheck/
+/Release_SectorHashing_ARMv8_BlankCheck/
+/Release_SectorHashing_BlankCheck/

@@ -1,0 +1,58 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "arm-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_SYSTEM_NAME": "Generic",
+        "CMAKE_SYSTEM_PROCESSOR": "arm",
+        "CMAKE_TRY_COMPILE_TARGET_TYPE": "STATIC_LIBRARY",
+        "CMAKE_C_COMPILER": "F:/MCUXpressoIDE_25.6.136/ide/plugins/com.nxp.mcuxpresso.tools.win32_25.6.0.202501151204/tools/bin/arm-none-eabi-gcc.exe",
+        "CMAKE_CXX_COMPILER": "F:/MCUXpressoIDE_25.6.136/ide/plugins/com.nxp.mcuxpresso.tools.win32_25.6.0.202501151204/tools/bin/arm-none-eabi-g++.exe",
+        "CMAKE_ASM_COMPILER": "F:/MCUXpressoIDE_25.6.136/ide/plugins/com.nxp.mcuxpresso.tools.win32_25.6.0.202501151204/tools/bin/arm-none-eabi-gcc.exe"
+      }
+    },
+    {
+      "name": "bootloader-debug",
+      "displayName": "Bootloader Debug (RT1062 + Ninja)",
+      "inherits": "arm-base",
+      "binaryDir": "${sourceDir}/out/build/bootloader-debug",
+      "cacheVariables": {
+        "VBA_CAN_BUILD_BOOTLOADER": "ON",
+        "VBA_CAN_BUILD_CAN_APP": "OFF"
+      }
+    },
+    {
+      "name": "can-app-debug",
+      "displayName": "CAN_APP Debug (RT1062 + Ninja)",
+      "inherits": "arm-base",
+      "binaryDir": "${sourceDir}/out/build/can-app-debug",
+      "cacheVariables": {
+        "VBA_CAN_BUILD_BOOTLOADER": "OFF",
+        "VBA_CAN_BUILD_CAN_APP": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "bootloader-debug",
+      "displayName": "Build Bootloader Debug",
+      "configurePreset": "bootloader-debug",
+      "jobs": 8
+    },
+    {
+      "name": "can-app-debug",
+      "displayName": "Build CAN_APP Debug",
+      "configurePreset": "can-app-debug",
+      "jobs": 8
+    }
+  ]
+}
