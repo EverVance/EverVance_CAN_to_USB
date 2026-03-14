@@ -5,6 +5,7 @@
 #include "board.h"
 #include "clock_config.h"
 #include "fsl_clock.h"
+#include "fsl_debug_console.h"
 #include "usb_device_config.h"
 #include "usb_device.h"
 #include "usb_device_ch9.h"
@@ -101,6 +102,9 @@ static void USB_DeviceUpdateSpeed(usb_device_handle handle)
     }
 
     USB_VendorBulkSetSpeed(s_CurrentSpeed);
+    PRINTF("USB negotiated speed: %s (%u-byte bulk)\r\n",
+           (s_CurrentSpeed == USB_SPEED_HIGH) ? "HIGH" : "FULL",
+           USB_VendorBulkGetCurrentPacketSize());
 }
 
 static void USB_RxRingReset(void)

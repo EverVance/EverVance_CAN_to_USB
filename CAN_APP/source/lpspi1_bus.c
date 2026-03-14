@@ -1,5 +1,8 @@
 #include "lpspi1_bus.h"
 
+#include <string.h>
+
+#include "fsl_common.h"
 #include "fsl_dmamux.h"
 #include "fsl_edma.h"
 #include "fsl_gpio.h"
@@ -12,10 +15,13 @@
 #define LPSPI1_DMA_RX_CHANNEL (0U)
 #define LPSPI1_DMA_TX_CHANNEL (1U)
 #define LPSPI1_TRANSFER_TIMEOUT (600000U)
+#define LPSPI1_RX_STAGING_SIZE (96U)
 
 static bool s_Lpspi1Ready;
 static volatile bool s_Lpspi1TransferDone;
 static volatile status_t s_Lpspi1TransferStatus;
+static uint32_t s_Lpspi1SourceClockHz;
+static uint32_t s_Lpspi1ConfiguredBaudHz;
 
 static edma_handle_t s_Lpspi1EdmaRxHandle;
 static edma_handle_t s_Lpspi1EdmaTxHandle;
@@ -50,7 +56,9 @@ bool LPSPI1_BusInit(uint32_t srcClockHz, uint32_t busHz)
         return false;
     }
 
-    /* 初始化 LPSPI1 主机配置。 */
+    s_Lpspi1SourceClockHz = srcClockHz;
+    s_Lpspi1ConfiguredBaudHz = busHz;
+
     LPSPI_MasterGetDefaultConfig(&masterConfig);
     masterConfig.baudRate = busHz;
     masterConfig.bitsPerFrame = 8U;
@@ -61,7 +69,6 @@ bool LPSPI1_BusInit(uint32_t srcClockHz, uint32_t busHz)
     LPSPI_MasterInit(LPSPI1, &masterConfig, srcClockHz);
     LPSPI_SetDummyData(LPSPI1, 0xFFU);
 
-    /* 初始化 DMA/DMAMUX，并将 LPSPI1 RX/TX 请求映射到通道 0/1。 */
     EDMA_GetDefaultConfig(&s_EdmaConfig);
     EDMA_Init(DMA0, &s_EdmaConfig);
 
@@ -92,15 +99,33 @@ bool LPSPI1_Transfer(const uint8_t *txData, uint8_t *rxData, size_t length)
 {
     lpspi_transfer_t transfer;
     uint32_t timeout;
+    SDK_ALIGN(uint8_t txStaging[LPSPI1_RX_STAGING_SIZE], FSL_FEATURE_L1DCACHE_LINESIZE_BYTE);
+    SDK_ALIGN(uint8_t rxStaging[LPSPI1_RX_STAGING_SIZE], FSL_FEATURE_L1DCACHE_LINESIZE_BYTE);
 
     if ((s_Lpspi1Ready == false) || (length == 0U))
     {
         return false;
     }
+    if (length > LPSPI1_RX_STAGING_SIZE)
+    {
+        return false;
+    }
 
-    /* 启动一次 eDMA 事务，外层仍提供同步等待语义。 */
-    transfer.txData = txData;
-    transfer.rxData = rxData;
+    if (txData != NULL)
+    {
+        (void)memcpy(txStaging, txData, length);
+    }
+    else
+    {
+        (void)memset(txStaging, 0xFF, length);
+    }
+    (void)memset(rxStaging, 0, length);
+#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
+    SCB_CleanDCache_by_Addr((uint32_t *)txStaging, (int32_t)length);
+#endif
+
+    transfer.txData = txStaging;
+    transfer.rxData = (rxData != NULL) ? rxStaging : NULL;
     transfer.dataSize = length;
     transfer.configFlags = (uint32_t)kLPSPI_MasterPcs0;
 
@@ -114,7 +139,6 @@ bool LPSPI1_Transfer(const uint8_t *txData, uint8_t *rxData, size_t length)
         return false;
     }
 
-    /* 轮询等待 DMA 回调置位完成标志。 */
     timeout = LPSPI1_TRANSFER_TIMEOUT;
     while ((!s_Lpspi1TransferDone) && (timeout > 0U))
     {
@@ -122,7 +146,30 @@ bool LPSPI1_Transfer(const uint8_t *txData, uint8_t *rxData, size_t length)
     }
 
     LPSPI1_Unselect();
-    return (s_Lpspi1TransferDone && (s_Lpspi1TransferStatus == kStatus_Success));
+    if (!(s_Lpspi1TransferDone && (s_Lpspi1TransferStatus == kStatus_Success)))
+    {
+        return false;
+    }
+
+    if (rxData != NULL)
+    {
+#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
+        SCB_InvalidateDCache_by_Addr((uint32_t *)rxStaging, (int32_t)length);
+#endif
+        (void)memcpy(rxData, rxStaging, length);
+    }
+
+    return true;
+}
+
+uint32_t LPSPI1_GetSourceClockHz(void)
+{
+    return s_Lpspi1SourceClockHz;
+}
+
+uint32_t LPSPI1_GetConfiguredBaudHz(void)
+{
+    return s_Lpspi1ConfiguredBaudHz;
 }
 
 void DMA0_DMA16_IRQHandler(void)

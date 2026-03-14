@@ -30,7 +30,15 @@ int main(void)
 
     BSP_PeripheralsInit();
     BSP_SetStatusLeds(false);
-    PRINTF("CAN_APP start, LPUART1 debug active @115200, LED4 untouched, launching FreeRTOS\r\n");
+    PRINTF("CAN_APP start, core=%u ahb=%u ipg=%u can=%u lpspi_root=%u flexspi=%u uart=%u\r\n",
+           BOARD_BOOTCLOCKRUN_CORE_CLOCK,
+           BOARD_BOOTCLOCKRUN_AHB_CLK_ROOT,
+           BOARD_BOOTCLOCKRUN_IPG_CLK_ROOT,
+           BOARD_BOOTCLOCKRUN_CAN_CLK_ROOT,
+           BOARD_BOOTCLOCKRUN_LPSPI_CLK_ROOT,
+           BOARD_BOOTCLOCKRUN_FLEXSPI_CLK_ROOT,
+           BOARD_BOOTCLOCKRUN_UART_CLK_ROOT);
+    PRINTF("CAN_APP debug uart=LPUART1@115200, LED4 untouched\r\n");
 
     RTOS_AppStart();
 

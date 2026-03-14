@@ -7,5 +7,7 @@
 
 bool LPSPI1_BusInit(uint32_t srcClockHz, uint32_t busHz);
 bool LPSPI1_Transfer(const uint8_t *txData, uint8_t *rxData, size_t length);
+uint32_t LPSPI1_GetSourceClockHz(void);
+uint32_t LPSPI1_GetConfiguredBaudHz(void);
 
 #endif

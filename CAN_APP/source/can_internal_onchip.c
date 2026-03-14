@@ -1,51 +1,68 @@
 #include "can_internal_onchip.h"
 
-#include <stddef.h>
 #include <string.h>
 
-#include "board/clock_config.h"
-#include "fsl_device_registers.h"
-#include "tja1042_drv.h"
+#include "can_bridge.h"
+#include "can_stack.h"
+#include "fsl_clock.h"
+#include "fsl_common.h"
+#include "fsl_debug_console.h"
+#include "fsl_flexcan.h"
 
-#define ONCHIP_TX_QUEUE_DEPTH (32U)
-#define ONCHIP_RX_QUEUE_DEPTH (32U)
-#define ONCHIP_TX_MB_INDEX (0U)
-#define ONCHIP_RX_MB_INDEX (1U)
-#define ONCHIP_CONFIG_TIMEOUT (100000U)
-
-#define FLEXCAN_MB_CODE_RX_EMPTY (0x4U)
-#define FLEXCAN_MB_CODE_TX_INACTIVE (0x8U)
-#define FLEXCAN_MB_CODE_TX_DATA (0xCU)
+#define ONCHIP_RX_QUEUE_DEPTH (16U)
+#define ONCHIP_EVENT_QUEUE_DEPTH (32U)
+#define ONCHIP_TX_MB_INDEX (8U)
+#define ONCHIP_RX_STD_MB_INDEX (9U)
+#define ONCHIP_RX_EXT_MB_INDEX (10U)
 
 typedef struct
 {
-    CAN_Type *base;
     can_channel_t channel;
-    can_channel_config_t config;
-    can_frame_t txQueue[ONCHIP_TX_QUEUE_DEPTH];
-    volatile uint8_t txHead;
-    volatile uint8_t txTail;
-    can_frame_t rxQueue[ONCHIP_RX_QUEUE_DEPTH];
-    volatile uint8_t rxHead;
-    volatile uint8_t rxTail;
-    uint32_t lastEsr1;
+    CAN_Type *base;
     bool supportsFd;
     bool ready;
-    bool fdEnabled;
+    bool txPending;
+    bool rxStdArmed;
+    bool rxExtArmed;
+    bool lastErrorLatched;
+    can_channel_config_t activeConfig;
+    can_driver_runtime_state_t runtimeState;
+    can_frame_t lastTxFrame;
+    can_frame_t rxQueue[ONCHIP_RX_QUEUE_DEPTH];
+    uint8_t rxHead;
+    uint8_t rxTail;
+    can_bus_event_t eventQueue[ONCHIP_EVENT_QUEUE_DEPTH];
+    uint8_t eventHead;
+    uint8_t eventTail;
+    flexcan_handle_t handle;
+    flexcan_mb_transfer_t txTransfer;
+    flexcan_mb_transfer_t rxStdTransfer;
+    flexcan_mb_transfer_t rxExtTransfer;
+    flexcan_frame_t txFrame;
+    flexcan_frame_t rxStdFrame;
+    flexcan_frame_t rxExtFrame;
+    flexcan_fd_frame_t txFdFrame;
+    flexcan_fd_frame_t rxStdFdFrame;
+    flexcan_fd_frame_t rxExtFdFrame;
 } onchip_channel_ctx_t;
 
-static onchip_channel_ctx_t s_OnchipCtx[kCanChannel_Count];
+static onchip_channel_ctx_t s_OnchipCtx[kCanChannel_Count] = {
+    {0},
+    {.channel = kCanChannel_Can2, .base = CAN3, .supportsFd = true},
+    {.channel = kCanChannel_Can3, .base = CAN1, .supportsFd = false},
+    {.channel = kCanChannel_Can4, .base = CAN2, .supportsFd = false},
+};
 
-static uint32_t EnterCritical(void)
+static FLEXCAN_CALLBACK(OnchipFlexcanCallback);
+
+static uint32_t OnchipEnterCritical(void)
 {
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    return primask;
+    return DisableGlobalIRQ();
 }
 
-static void ExitCritical(uint32_t primask)
+static void OnchipExitCritical(uint32_t primask)
 {
-    __set_PRIMASK(primask);
+    EnableGlobalIRQ(primask);
 }
 
 static bool OnchipIsManagedChannel(can_channel_t channel)
@@ -53,7 +70,12 @@ static bool OnchipIsManagedChannel(can_channel_t channel)
     return (channel == kCanChannel_Can2) || (channel == kCanChannel_Can3) || (channel == kCanChannel_Can4);
 }
 
-static onchip_channel_ctx_t *OnchipGetContext(can_channel_t channel)
+static bool OnchipUsesFdController(const onchip_channel_ctx_t *ctx)
+{
+    return (ctx != NULL) && ctx->supportsFd;
+}
+
+static onchip_channel_ctx_t *OnchipGetCtx(can_channel_t channel)
 {
     if (!OnchipIsManagedChannel(channel))
     {
@@ -63,839 +85,641 @@ static onchip_channel_ctx_t *OnchipGetContext(can_channel_t channel)
     return &s_OnchipCtx[channel];
 }
 
-static bool OnchipQueuePush(can_frame_t *queue, volatile uint8_t *head, volatile uint8_t *tail, uint8_t depth, const can_frame_t *frame)
+static uint16_t OnchipComputeClassicSamplePointPermille(const flexcan_timing_config_t *timingConfig)
+{
+    uint32_t sampleTq;
+    uint32_t totalTq;
+
+    if (timingConfig == NULL)
+    {
+        return 0U;
+    }
+
+    sampleTq = 1U + ((uint32_t)timingConfig->propSeg + 1U) + ((uint32_t)timingConfig->phaseSeg1 + 1U);
+    totalTq = sampleTq + ((uint32_t)timingConfig->phaseSeg2 + 1U);
+    return (totalTq == 0U) ? 0U : (uint16_t)(((sampleTq * 1000U) + (totalTq / 2U)) / totalTq);
+}
+
+static uint16_t OnchipComputeFdDataSamplePointPermille(const flexcan_timing_config_t *timingConfig)
+{
+    uint32_t sampleTq;
+    uint32_t totalTq;
+
+    if (timingConfig == NULL)
+    {
+        return 0U;
+    }
+
+    sampleTq = 1U + (uint32_t)timingConfig->fpropSeg + ((uint32_t)timingConfig->fphaseSeg1 + 1U);
+    totalTq = sampleTq + ((uint32_t)timingConfig->fphaseSeg2 + 1U);
+    return (totalTq == 0U) ? 0U : (uint16_t)(((sampleTq * 1000U) + (totalTq / 2U)) / totalTq);
+}
+
+static bool OnchipBuildTimingConfig(onchip_channel_ctx_t *ctx,
+                                    uint32_t sourceClockHz,
+                                    const can_channel_config_t *requestedConfig,
+                                    flexcan_timing_config_t *timingConfig,
+                                    can_channel_config_t *appliedConfig)
+{
+    bool ok;
+
+    if ((ctx == NULL) || (requestedConfig == NULL) || (timingConfig == NULL) || (appliedConfig == NULL))
+    {
+        return false;
+    }
+    *appliedConfig = *requestedConfig;
+    (void)memset(timingConfig, 0, sizeof(*timingConfig));
+
+    if (OnchipUsesFdController(ctx))
+    {
+        if (requestedConfig->frameFormat == kCanFrameFormat_Fd)
+        {
+            ok = FLEXCAN_FDCalculateImprovedTimingValues(
+                ctx->base, requestedConfig->nominalBitrate, requestedConfig->dataBitrate, sourceClockHz, timingConfig);
+            if (!ok)
+            {
+                PRINTF("Onchip timing fail CH%u FD n=%u d=%u src=%u\r\n",
+                       (uint32_t)ctx->channel,
+                       requestedConfig->nominalBitrate,
+                       requestedConfig->dataBitrate,
+                       sourceClockHz);
+                return false;
+            }
+            appliedConfig->dataSamplePointPermille = OnchipComputeFdDataSamplePointPermille(timingConfig);
+        }
+        else
+        {
+            ok = FLEXCAN_CalculateImprovedTimingValues(ctx->base, requestedConfig->nominalBitrate, sourceClockHz, timingConfig);
+            if (!ok)
+            {
+                PRINTF("Onchip timing fail CH%u classic-on-fd n=%u src=%u\r\n",
+                       (uint32_t)ctx->channel,
+                       requestedConfig->nominalBitrate,
+                       sourceClockHz);
+                return false;
+            }
+            timingConfig->fpreDivider = timingConfig->preDivider;
+            timingConfig->fphaseSeg1 = timingConfig->phaseSeg1;
+            timingConfig->fphaseSeg2 = timingConfig->phaseSeg2;
+            timingConfig->fpropSeg = (timingConfig->propSeg + 1U);
+            timingConfig->frJumpwidth = timingConfig->rJumpwidth;
+            appliedConfig->dataBitrate = requestedConfig->nominalBitrate;
+            appliedConfig->dataSamplePointPermille = 0U;
+        }
+    }
+    else
+    {
+        ok = FLEXCAN_CalculateImprovedTimingValues(ctx->base, requestedConfig->nominalBitrate, sourceClockHz, timingConfig);
+        if (!ok)
+        {
+            PRINTF("Onchip timing fail CH%u classic n=%u src=%u\r\n",
+                   (uint32_t)ctx->channel,
+                   requestedConfig->nominalBitrate,
+                   sourceClockHz);
+            return false;
+        }
+    }
+
+    appliedConfig->nominalSamplePointPermille = OnchipComputeClassicSamplePointPermille(timingConfig);
+    return true;
+}
+
+static bool OnchipQueueFramePush(onchip_channel_ctx_t *ctx, const can_frame_t *frame)
 {
     uint8_t nextHead;
 
-    if (frame == NULL)
+    if ((ctx == NULL) || (frame == NULL))
     {
         return false;
     }
 
-    nextHead = (uint8_t)((*head + 1U) % depth);
-    if (nextHead == *tail)
+    nextHead = (uint8_t)((ctx->rxHead + 1U) % ONCHIP_RX_QUEUE_DEPTH);
+    if (nextHead == ctx->rxTail)
     {
         return false;
     }
 
-    queue[*head] = *frame;
-    *head = nextHead;
+    ctx->rxQueue[ctx->rxHead] = *frame;
+    ctx->rxHead = nextHead;
     return true;
 }
 
-static bool OnchipQueuePop(can_frame_t *queue, volatile uint8_t *head, volatile uint8_t *tail, uint8_t depth, can_frame_t *frame)
+static bool OnchipQueueFramePop(onchip_channel_ctx_t *ctx, can_frame_t *frame)
 {
-    (void)depth;
-
-    if ((frame == NULL) || (*head == *tail))
+    if ((ctx == NULL) || (frame == NULL) || (ctx->rxHead == ctx->rxTail))
     {
         return false;
     }
 
-    *frame = queue[*tail];
-    *tail = (uint8_t)((*tail + 1U) % ONCHIP_RX_QUEUE_DEPTH);
+    *frame = ctx->rxQueue[ctx->rxTail];
+    ctx->rxTail = (uint8_t)((ctx->rxTail + 1U) % ONCHIP_RX_QUEUE_DEPTH);
     return true;
 }
 
-static bool OnchipWaitMaskSet(volatile uint32_t *reg, uint32_t mask)
+static bool OnchipQueueEventPush(onchip_channel_ctx_t *ctx, const can_bus_event_t *event)
 {
-    uint32_t retry;
+    uint8_t nextHead;
 
-    for (retry = 0U; retry < ONCHIP_CONFIG_TIMEOUT; retry++)
-    {
-        if ((*reg & mask) == mask)
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool OnchipWaitMaskClear(volatile uint32_t *reg, uint32_t mask)
-{
-    uint32_t retry;
-
-    for (retry = 0U; retry < ONCHIP_CONFIG_TIMEOUT; retry++)
-    {
-        if ((*reg & mask) == 0U)
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool OnchipEnterFreeze(onchip_channel_ctx_t *ctx)
-{
-    uint32_t mcr;
-
-    if ((ctx == NULL) || (ctx->base == NULL))
+    if ((ctx == NULL) || (event == NULL))
     {
         return false;
     }
 
-    mcr = ctx->base->MCR;
-    mcr |= CAN_MCR_FRZ_MASK | CAN_MCR_HALT_MASK;
-    mcr &= ~CAN_MCR_MDIS_MASK;
-    ctx->base->MCR = mcr;
-    return OnchipWaitMaskSet(&ctx->base->MCR, CAN_MCR_FRZACK_MASK);
-}
-
-static bool OnchipExitFreeze(onchip_channel_ctx_t *ctx)
-{
-    uint32_t mcr;
-
-    if ((ctx == NULL) || (ctx->base == NULL))
+    nextHead = (uint8_t)((ctx->eventHead + 1U) % ONCHIP_EVENT_QUEUE_DEPTH);
+    if (nextHead == ctx->eventTail)
     {
         return false;
     }
 
-    mcr = ctx->base->MCR;
-    mcr &= ~(CAN_MCR_HALT_MASK | CAN_MCR_FRZ_MASK);
-    ctx->base->MCR = mcr;
-    return OnchipWaitMaskClear(&ctx->base->MCR, CAN_MCR_FRZACK_MASK);
-}
-
-static bool OnchipCalcClassicTiming(uint32_t bitrate, uint16_t samplePointPermille, uint32_t *ctrl1)
-{
-    uint32_t presdiv;
-    uint32_t bestError = 0xFFFFFFFFU;
-    uint32_t bestCtrl1 = 0U;
-    uint32_t tqClock = BOARD_BOOTCLOCKRUN_CAN_CLK_ROOT;
-
-    if ((bitrate == 0U) || (ctrl1 == NULL))
-    {
-        return false;
-    }
-
-    for (presdiv = 0U; presdiv <= 255U; presdiv++)
-    {
-        uint32_t tqs = tqClock / ((presdiv + 1U) * bitrate);
-        uint32_t tseg1;
-        uint32_t tseg2;
-        uint32_t propseg;
-        uint32_t pseg1;
-        uint32_t sampleTq;
-        uint32_t sampleError;
-        uint32_t actualBitrate;
-
-        if ((tqs < 8U) || (tqs > 25U))
-        {
-            continue;
-        }
-        actualBitrate = tqClock / ((presdiv + 1U) * tqs);
-        if (actualBitrate != bitrate)
-        {
-            continue;
-        }
-
-        sampleTq = (tqs * samplePointPermille + 500U) / 1000U;
-        if ((sampleTq < 3U) || (sampleTq >= tqs))
-        {
-            continue;
-        }
-
-        tseg1 = sampleTq - 1U;
-        tseg2 = tqs - sampleTq;
-        if ((tseg2 < 2U) || (tseg2 > 8U))
-        {
-            continue;
-        }
-
-        propseg = tseg1 / 2U;
-        if (propseg < 1U)
-        {
-            propseg = 1U;
-        }
-        if (propseg > 8U)
-        {
-            propseg = 8U;
-        }
-
-        pseg1 = tseg1 - propseg;
-        if (pseg1 < 1U)
-        {
-            pseg1 = 1U;
-            propseg = tseg1 - pseg1;
-        }
-        if ((propseg < 1U) || (propseg > 8U) || (pseg1 < 1U) || (pseg1 > 8U))
-        {
-            continue;
-        }
-
-        sampleError = (uint32_t)((int32_t)(samplePointPermille - (uint16_t)((sampleTq * 1000U) / tqs)));
-        if (sampleError > 1000U)
-        {
-            sampleError = 1000U - sampleError;
-        }
-
-        if (sampleError <= bestError)
-        {
-            bestError = sampleError;
-            bestCtrl1 = CAN_CTRL1_PRESDIV(presdiv) | CAN_CTRL1_PROPSEG(propseg - 1U) | CAN_CTRL1_PSEG1(pseg1 - 1U) |
-                        CAN_CTRL1_PSEG2(tseg2 - 1U) | CAN_CTRL1_RJW(((tseg2 > 4U) ? 4U : tseg2) - 1U) |
-                        CAN_CTRL1_BOFFREC(1U);
-            if (sampleError == 0U)
-            {
-                break;
-            }
-        }
-    }
-
-    if (bestError == 0xFFFFFFFFU)
-    {
-        return false;
-    }
-
-    *ctrl1 = bestCtrl1;
+    ctx->eventQueue[ctx->eventHead] = *event;
+    ctx->eventHead = nextHead;
     return true;
 }
 
-static bool OnchipCalcCbtTiming(uint32_t bitrate, uint16_t samplePointPermille, uint32_t *cbt)
+static bool OnchipQueueEventPop(onchip_channel_ctx_t *ctx, can_bus_event_t *event)
 {
-    uint32_t presdiv;
-    uint32_t bestError = 0xFFFFFFFFU;
-    uint32_t bestCbt = 0U;
-    uint32_t tqClock = BOARD_BOOTCLOCKRUN_CAN_CLK_ROOT;
-
-    if ((bitrate == 0U) || (cbt == NULL))
+    if ((ctx == NULL) || (event == NULL) || (ctx->eventHead == ctx->eventTail))
     {
         return false;
     }
 
-    for (presdiv = 0U; presdiv <= 1023U; presdiv++)
-    {
-        uint32_t tqs = tqClock / ((presdiv + 1U) * bitrate);
-        uint32_t sampleTq;
-        uint32_t tseg1;
-        uint32_t tseg2;
-        uint32_t propseg;
-        uint32_t pseg1;
-        uint32_t sampleError;
-        uint32_t actualBitrate;
-
-        if ((tqs < 8U) || (tqs > 80U))
-        {
-            continue;
-        }
-        actualBitrate = tqClock / ((presdiv + 1U) * tqs);
-        if (actualBitrate != bitrate)
-        {
-            continue;
-        }
-
-        sampleTq = (tqs * samplePointPermille + 500U) / 1000U;
-        if ((sampleTq < 3U) || (sampleTq >= tqs))
-        {
-            continue;
-        }
-
-        tseg1 = sampleTq - 1U;
-        tseg2 = tqs - sampleTq;
-        if ((tseg2 < 2U) || (tseg2 > 32U))
-        {
-            continue;
-        }
-
-        propseg = tseg1 / 2U;
-        if (propseg < 1U)
-        {
-            propseg = 1U;
-        }
-        if (propseg > 64U)
-        {
-            propseg = 64U;
-        }
-
-        pseg1 = tseg1 - propseg;
-        if (pseg1 < 1U)
-        {
-            pseg1 = 1U;
-            propseg = tseg1 - pseg1;
-        }
-        if ((propseg < 1U) || (propseg > 64U) || (pseg1 < 1U) || (pseg1 > 32U))
-        {
-            continue;
-        }
-
-        sampleError = (uint32_t)((int32_t)(samplePointPermille - (uint16_t)((sampleTq * 1000U) / tqs)));
-        if (sampleError > 1000U)
-        {
-            sampleError = 1000U - sampleError;
-        }
-
-        if (sampleError <= bestError)
-        {
-            bestError = sampleError;
-            bestCbt = CAN_CBT_EPRESDIV(presdiv) | CAN_CBT_EPROPSEG(propseg - 1U) | CAN_CBT_EPSEG1(pseg1 - 1U) |
-                      CAN_CBT_EPSEG2(tseg2 - 1U) | CAN_CBT_ERJW(((tseg2 > 16U) ? 16U : tseg2) - 1U) | CAN_CBT_BTF(1U);
-            if (sampleError == 0U)
-            {
-                break;
-            }
-        }
-    }
-
-    if (bestError == 0xFFFFFFFFU)
-    {
-        return false;
-    }
-
-    *cbt = bestCbt;
+    *event = ctx->eventQueue[ctx->eventTail];
+    ctx->eventTail = (uint8_t)((ctx->eventTail + 1U) % ONCHIP_EVENT_QUEUE_DEPTH);
     return true;
 }
 
-static bool OnchipCalcFdTiming(uint32_t bitrate, uint16_t samplePointPermille, uint32_t *fdcbt)
+static void OnchipResetQueues(onchip_channel_ctx_t *ctx)
 {
-    uint32_t presdiv;
-    uint32_t bestError = 0xFFFFFFFFU;
-    uint32_t bestFdcbt = 0U;
-    uint32_t tqClock = BOARD_BOOTCLOCKRUN_CAN_CLK_ROOT;
-
-    if ((bitrate == 0U) || (fdcbt == NULL))
+    if (ctx == NULL)
     {
-        return false;
+        return;
     }
 
-    for (presdiv = 0U; presdiv <= 1023U; presdiv++)
-    {
-        uint32_t tqs = tqClock / ((presdiv + 1U) * bitrate);
-        uint32_t sampleTq;
-        uint32_t tseg1;
-        uint32_t tseg2;
-        uint32_t propseg;
-        uint32_t pseg1;
-        uint32_t sampleError;
-        uint32_t actualBitrate;
-
-        if ((tqs < 5U) || (tqs > 25U))
-        {
-            continue;
-        }
-        actualBitrate = tqClock / ((presdiv + 1U) * tqs);
-        if (actualBitrate != bitrate)
-        {
-            continue;
-        }
-
-        sampleTq = (tqs * samplePointPermille + 500U) / 1000U;
-        if ((sampleTq < 3U) || (sampleTq >= tqs))
-        {
-            continue;
-        }
-
-        tseg1 = sampleTq - 1U;
-        tseg2 = tqs - sampleTq;
-        if ((tseg2 < 2U) || (tseg2 > 8U))
-        {
-            continue;
-        }
-
-        propseg = tseg1 / 2U;
-        if (propseg < 1U)
-        {
-            propseg = 1U;
-        }
-        if (propseg > 32U)
-        {
-            propseg = 32U;
-        }
-
-        pseg1 = tseg1 - propseg;
-        if (pseg1 < 1U)
-        {
-            pseg1 = 1U;
-            propseg = tseg1 - pseg1;
-        }
-        if ((propseg < 1U) || (propseg > 32U) || (pseg1 < 1U) || (pseg1 > 8U))
-        {
-            continue;
-        }
-
-        sampleError = (uint32_t)((int32_t)(samplePointPermille - (uint16_t)((sampleTq * 1000U) / tqs)));
-        if (sampleError > 1000U)
-        {
-            sampleError = 1000U - sampleError;
-        }
-
-        if (sampleError <= bestError)
-        {
-            bestError = sampleError;
-            bestFdcbt = CAN_FDCBT_FPRESDIV(presdiv) | CAN_FDCBT_FPROPSEG(propseg - 1U) | CAN_FDCBT_FPSEG1(pseg1 - 1U) |
-                        CAN_FDCBT_FPSEG2(tseg2 - 1U) | CAN_FDCBT_FRJW(((tseg2 > 8U) ? 8U : tseg2) - 1U);
-            if (sampleError == 0U)
-            {
-                break;
-            }
-        }
-    }
-
-    if (bestError == 0xFFFFFFFFU)
-    {
-        return false;
-    }
-
-    *fdcbt = bestFdcbt;
-    return true;
+    ctx->rxHead = 0U;
+    ctx->rxTail = 0U;
+    ctx->eventHead = 0U;
+    ctx->eventTail = 0U;
 }
 
-static uint8_t OnchipLengthToDlc(uint8_t length, bool fdFrame)
+static uint8_t OnchipLengthToDlc(uint8_t length)
 {
-    if (!fdFrame)
+    if (length <= 8U)
     {
         return length;
     }
-
-    switch (length)
+    if (length <= 12U)
     {
-        case 0U:
-        case 1U:
-        case 2U:
-        case 3U:
-        case 4U:
-        case 5U:
-        case 6U:
-        case 7U:
-        case 8U:
-            return length;
-        case 12U:
-            return 9U;
-        case 16U:
-            return 10U;
-        case 20U:
-            return 11U;
-        case 24U:
-            return 12U;
-        case 32U:
-            return 13U;
-        case 48U:
-            return 14U;
-        case 64U:
-            return 15U;
-        default:
-            return 0xFFU;
+        return 9U;
     }
+    if (length <= 16U)
+    {
+        return 10U;
+    }
+    if (length <= 20U)
+    {
+        return 11U;
+    }
+    if (length <= 24U)
+    {
+        return 12U;
+    }
+    if (length <= 32U)
+    {
+        return 13U;
+    }
+    if (length <= 48U)
+    {
+        return 14U;
+    }
+
+    return 15U;
 }
 
 static uint8_t OnchipDlcToLength(uint8_t dlc, bool fdFrame)
 {
-    if (!fdFrame)
+    if ((!fdFrame) || (dlc <= 8U))
     {
         return (dlc <= 8U) ? dlc : 8U;
     }
 
-    switch (dlc)
-    {
-        case 0U:
-        case 1U:
-        case 2U:
-        case 3U:
-        case 4U:
-        case 5U:
-        case 6U:
-        case 7U:
-        case 8U:
-            return dlc;
-        case 9U:
-            return 12U;
-        case 10U:
-            return 16U;
-        case 11U:
-            return 20U;
-        case 12U:
-            return 24U;
-        case 13U:
-            return 32U;
-        case 14U:
-            return 48U;
-        case 15U:
-            return 64U;
-        default:
-            return 0U;
-    }
+    return (uint8_t)DLC_LENGTH_DECODE(dlc);
+}
+
+static bool OnchipIsExtendedId(uint32_t id)
+{
+    return (id > 0x7FFU);
 }
 
 static uint32_t OnchipEncodeId(uint32_t id, bool extended)
 {
-    return extended ? (id & 0x1FFFFFFFU) : ((id & 0x7FFU) << 18U);
+    return extended ? FLEXCAN_ID_EXT(id) : FLEXCAN_ID_STD(id);
 }
 
 static uint32_t OnchipDecodeId(uint32_t rawId, bool extended)
 {
-    return extended ? (rawId & 0x1FFFFFFFU) : ((rawId >> 18U) & 0x7FFU);
+    return extended ? (rawId & 0x1FFFFFFFU) : ((rawId >> CAN_ID_STD_SHIFT) & 0x7FFU);
 }
 
-static void OnchipWriteWords(onchip_channel_ctx_t *ctx, uint8_t mbIndex, const uint32_t *words, uint8_t wordCount)
+static uint32_t OnchipPackWord(const uint8_t *src, uint8_t length, uint8_t offset)
+{
+    uint32_t value = 0U;
+    uint8_t i;
+
+    for (i = 0U; i < 4U; i++)
+    {
+        uint8_t index = (uint8_t)(offset + i);
+
+        if (index < length)
+        {
+            value |= ((uint32_t)src[index]) << (8U * (3U - i));
+        }
+    }
+
+    return value;
+}
+
+static void OnchipUnpackWords(uint8_t *dst, uint8_t length, const uint32_t *srcWords, uint8_t wordCount)
 {
     uint8_t i;
 
-    if (ctx->fdEnabled)
+    if ((dst == NULL) || (srcWords == NULL))
     {
-        for (i = 0U; i < wordCount; i++)
-        {
-            ctx->base->MB_64B.MB_64B_L[mbIndex].WORD[i] = words[i];
-        }
-        for (; i < 16U; i++)
-        {
-            ctx->base->MB_64B.MB_64B_L[mbIndex].WORD[i] = 0U;
-        }
+        return;
     }
-    else
-    {
-        ctx->base->MB[mbIndex].WORD0 = (wordCount > 0U) ? words[0] : 0U;
-        ctx->base->MB[mbIndex].WORD1 = (wordCount > 1U) ? words[1] : 0U;
-    }
-}
 
-static void OnchipReadWords(onchip_channel_ctx_t *ctx, uint8_t mbIndex, uint32_t *words, uint8_t wordCount)
-{
-    uint8_t i;
+    for (i = 0U; i < length; i++)
+    {
+        uint8_t wordIndex = (uint8_t)(i / 4U);
 
-    if (ctx->fdEnabled)
-    {
-        for (i = 0U; i < wordCount; i++)
+        if (wordIndex >= wordCount)
         {
-            words[i] = ctx->base->MB_64B.MB_64B_L[mbIndex].WORD[i];
+            break;
         }
-    }
-    else
-    {
-        if (wordCount > 0U)
-        {
-            words[0] = ctx->base->MB[mbIndex].WORD0;
-        }
-        if (wordCount > 1U)
-        {
-            words[1] = ctx->base->MB[mbIndex].WORD1;
-        }
+
+        dst[i] = (uint8_t)((srcWords[wordIndex] >> (8U * (3U - (i % 4U)))) & 0xFFU);
     }
 }
 
-static bool OnchipApplyHardwareConfig(onchip_channel_ctx_t *ctx, const can_channel_config_t *config)
+static bool OnchipFrameIsFdPayload(const can_frame_t *frame)
 {
-    uint32_t ctrl1 = 0U;
-    uint32_t cbt = 0U;
-    uint32_t fdctrl = 0U;
-    uint32_t fdcbt = 0U;
-    uint32_t mcr;
+    return (frame != NULL) && ((((frame->flags & CAN_BRIDGE_FLAG_CANFD) != 0U) || (frame->dlc > 8U)));
+}
 
-    if ((ctx == NULL) || (config == NULL) || (ctx->base == NULL))
+static void OnchipFrameToClassic(const can_frame_t *src, flexcan_frame_t *dst)
+{
+    bool extended;
+
+    (void)memset(dst, 0, sizeof(*dst));
+    extended = OnchipIsExtendedId(src->id);
+
+    dst->format = extended ? (uint32_t)kFLEXCAN_FrameFormatExtend : (uint32_t)kFLEXCAN_FrameFormatStandard;
+    dst->type = (uint32_t)kFLEXCAN_FrameTypeData;
+    dst->length = (src->dlc > 8U) ? 8U : src->dlc;
+    dst->id = OnchipEncodeId(src->id, extended);
+    dst->dataWord0 = OnchipPackWord(src->data, dst->length, 0U);
+    dst->dataWord1 = OnchipPackWord(src->data, dst->length, 4U);
+}
+
+static void OnchipFrameToFd(const can_frame_t *src, bool fdFrame, bool enableBrs, flexcan_fd_frame_t *dst)
+{
+    bool extended;
+    uint8_t word;
+    uint8_t payloadLength;
+
+    (void)memset(dst, 0, sizeof(*dst));
+    extended = OnchipIsExtendedId(src->id);
+    payloadLength = fdFrame ? src->dlc : ((src->dlc > 8U) ? 8U : src->dlc);
+
+    dst->format = extended ? (uint32_t)kFLEXCAN_FrameFormatExtend : (uint32_t)kFLEXCAN_FrameFormatStandard;
+    dst->type = (uint32_t)kFLEXCAN_FrameTypeData;
+    dst->length = fdFrame ? OnchipLengthToDlc(payloadLength) : payloadLength;
+    dst->id = OnchipEncodeId(src->id, extended);
+    dst->edl = fdFrame ? 1U : 0U;
+    dst->brs = (fdFrame && enableBrs) ? 1U : 0U;
+
+    for (word = 0U; word < 16U; word++)
+    {
+        dst->dataWord[word] = OnchipPackWord(src->data, payloadLength, (uint8_t)(word * 4U));
+    }
+}
+
+static void OnchipClassicToFrame(const flexcan_frame_t *src, can_frame_t *dst)
+{
+    bool extended;
+    uint32_t words[2];
+
+    (void)memset(dst, 0, sizeof(*dst));
+    extended = (src->format == (uint32_t)kFLEXCAN_FrameFormatExtend);
+    dst->id = OnchipDecodeId(src->id, extended);
+    dst->dlc = (uint8_t)src->length;
+    dst->flags = 0U;
+
+    words[0] = src->dataWord0;
+    words[1] = src->dataWord1;
+    OnchipUnpackWords(dst->data, dst->dlc, words, 2U);
+}
+
+static void OnchipFdToFrame(const flexcan_fd_frame_t *src, can_frame_t *dst)
+{
+    bool extended;
+    uint8_t length;
+    bool fdFrame;
+
+    (void)memset(dst, 0, sizeof(*dst));
+    extended = (src->format == (uint32_t)kFLEXCAN_FrameFormatExtend);
+    fdFrame = (src->edl != 0U);
+    length = OnchipDlcToLength((uint8_t)src->length, fdFrame);
+
+    dst->id = OnchipDecodeId(src->id, extended);
+    dst->dlc = length;
+    dst->flags = fdFrame ? CAN_BRIDGE_FLAG_CANFD : 0U;
+    OnchipUnpackWords(dst->data, dst->dlc, src->dataWord, 16U);
+}
+
+static void OnchipResetRuntimeContext(onchip_channel_ctx_t *ctx)
+{
+    if (ctx == NULL)
+    {
+        return;
+    }
+
+    ctx->ready = false;
+    ctx->txPending = false;
+    ctx->rxStdArmed = false;
+    ctx->rxExtArmed = false;
+    ctx->lastErrorLatched = false;
+    ctx->activeConfig = (can_channel_config_t){0};
+    ctx->runtimeState = (can_driver_runtime_state_t){0};
+    ctx->lastTxFrame = (can_frame_t){0};
+    ctx->txTransfer = (flexcan_mb_transfer_t){0};
+    ctx->rxStdTransfer = (flexcan_mb_transfer_t){0};
+    ctx->rxExtTransfer = (flexcan_mb_transfer_t){0};
+    ctx->txFrame = (flexcan_frame_t){0};
+    ctx->rxStdFrame = (flexcan_frame_t){0};
+    ctx->rxExtFrame = (flexcan_frame_t){0};
+    ctx->txFdFrame = (flexcan_fd_frame_t){0};
+    ctx->rxStdFdFrame = (flexcan_fd_frame_t){0};
+    ctx->rxExtFdFrame = (flexcan_fd_frame_t){0};
+    OnchipResetQueues(ctx);
+}
+
+static uint8_t OnchipMapEsr1ToErrorCode(uint32_t esr1)
+{
+    if ((esr1 & CAN_ESR1_ACKERR_MASK) != 0U)
+    {
+        return 0x05U;
+    }
+    if (((esr1 & CAN_ESR1_BIT0ERR_MASK) != 0U) || ((esr1 & CAN_ESR1_BIT1ERR_MASK) != 0U) ||
+        ((esr1 & CAN_ESR1_BIT0ERR_FAST_MASK) != 0U) || ((esr1 & CAN_ESR1_BIT1ERR_FAST_MASK) != 0U))
+    {
+        return 0x01U;
+    }
+    if (((esr1 & CAN_ESR1_STFERR_MASK) != 0U) || ((esr1 & CAN_ESR1_STFERR_FAST_MASK) != 0U))
+    {
+        return 0x02U;
+    }
+    if (((esr1 & CAN_ESR1_CRCERR_MASK) != 0U) || ((esr1 & CAN_ESR1_CRCERR_FAST_MASK) != 0U))
+    {
+        return 0x03U;
+    }
+    if (((esr1 & CAN_ESR1_FRMERR_MASK) != 0U) || ((esr1 & CAN_ESR1_FRMERR_FAST_MASK) != 0U))
+    {
+        return 0x04U;
+    }
+    if (((esr1 & CAN_ESR1_FLTCONF_MASK) >> CAN_ESR1_FLTCONF_SHIFT) == 0x01U)
+    {
+        return 0x07U;
+    }
+    if (((esr1 & CAN_ESR1_BOFFINT_MASK) != 0U) ||
+        ((((esr1 & CAN_ESR1_FLTCONF_MASK) >> CAN_ESR1_FLTCONF_SHIFT) & 0x02U) != 0U))
+    {
+        return 0x06U;
+    }
+
+    return 0U;
+}
+
+static void OnchipRefreshRuntimeState(onchip_channel_ctx_t *ctx, uint32_t esr1)
+{
+    uint32_t fltconf;
+
+    if (ctx == NULL)
+    {
+        return;
+    }
+
+    fltconf = (esr1 & CAN_ESR1_FLTCONF_MASK) >> CAN_ESR1_FLTCONF_SHIFT;
+    ctx->runtimeState.busOff = (fltconf == 0x02U) ? 1U : 0U;
+    ctx->runtimeState.errorPassive = (fltconf == 0x01U) ? 1U : 0U;
+    ctx->runtimeState.txPending = ctx->txPending ? 1U : 0U;
+    ctx->runtimeState.rxPending = (ctx->rxHead != ctx->rxTail) ? 1U : 0U;
+}
+
+static bool OnchipStartReceive(onchip_channel_ctx_t *ctx, uint8_t mbIdx)
+{
+    status_t status;
+
+    if ((ctx == NULL) || (!ctx->ready))
     {
         return false;
     }
 
-    if (!OnchipCalcClassicTiming(config->nominalBitrate, config->nominalSamplePointPermille, &ctrl1))
+    if (OnchipUsesFdController(ctx))
     {
-        return false;
+        flexcan_mb_transfer_t *transfer = (mbIdx == ONCHIP_RX_STD_MB_INDEX) ? &ctx->rxStdTransfer : &ctx->rxExtTransfer;
+
+        transfer->mbIdx = mbIdx;
+        transfer->framefd = (mbIdx == ONCHIP_RX_STD_MB_INDEX) ? &ctx->rxStdFdFrame : &ctx->rxExtFdFrame;
+        transfer->frame = NULL;
+        status = FLEXCAN_TransferFDReceiveNonBlocking(ctx->base, &ctx->handle, transfer);
     }
-    if (ctx->supportsFd && (config->frameFormat == kCanFrameFormat_Fd))
+    else
     {
-        if (!OnchipCalcCbtTiming(config->nominalBitrate, config->nominalSamplePointPermille, &cbt) ||
-            !OnchipCalcFdTiming(config->dataBitrate, config->dataSamplePointPermille, &fdcbt))
+        flexcan_mb_transfer_t *transfer = (mbIdx == ONCHIP_RX_STD_MB_INDEX) ? &ctx->rxStdTransfer : &ctx->rxExtTransfer;
+
+        transfer->mbIdx = mbIdx;
+        transfer->frame = (mbIdx == ONCHIP_RX_STD_MB_INDEX) ? &ctx->rxStdFrame : &ctx->rxExtFrame;
+        status = FLEXCAN_TransferReceiveNonBlocking(ctx->base, &ctx->handle, transfer);
+    }
+
+    if (status == kStatus_Success)
+    {
+        if (mbIdx == ONCHIP_RX_STD_MB_INDEX)
         {
-            return false;
-        }
-        fdctrl = CAN_FDCTRL_MBDSR0(3U) | CAN_FDCTRL_FDRATE(1U) | CAN_FDCTRL_TDCEN(1U) | CAN_FDCTRL_TDCOFF(4U);
-        ctx->fdEnabled = true;
-    }
-    else
-    {
-        ctx->fdEnabled = false;
-    }
-
-    ctx->base->MCR |= CAN_MCR_MDIS_MASK;
-    mcr = ctx->base->MCR;
-    mcr &= ~(CAN_MCR_MAXMB_MASK | CAN_MCR_IDAM_MASK);
-    mcr |= CAN_MCR_MAXMB(ONCHIP_RX_MB_INDEX) | CAN_MCR_FRZ_MASK | CAN_MCR_HALT_MASK | CAN_MCR_SRXDIS_MASK |
-           CAN_MCR_IRMQ_MASK;
-    if (ctx->fdEnabled)
-    {
-        mcr |= CAN_MCR_FDEN_MASK;
-    }
-    else
-    {
-        mcr &= ~CAN_MCR_FDEN_MASK;
-    }
-    mcr &= ~CAN_MCR_MDIS_MASK;
-    ctx->base->MCR = mcr;
-    if (!OnchipEnterFreeze(ctx))
-    {
-        return false;
-    }
-
-    ctx->base->CTRL1 = ctrl1 & ~(CAN_CTRL1_LPB_MASK | CAN_CTRL1_LOM_MASK);
-    ctx->base->CTRL2 |= CAN_CTRL2_ISOCANFDEN(ctx->fdEnabled ? 1U : 0U);
-    if (ctx->supportsFd)
-    {
-        ctx->base->CBT = ctx->fdEnabled ? cbt : 0U;
-        ctx->base->FDCTRL = fdctrl;
-        ctx->base->FDCBT = ctx->fdEnabled ? fdcbt : 0U;
-    }
-
-    ctx->base->RXMGMASK = 0U;
-    ctx->base->RX14MASK = 0U;
-    ctx->base->RX15MASK = 0U;
-    {
-        uint32_t i;
-        for (i = 0U; i < 64U; i++)
-        {
-            ctx->base->RXIMR[i] = 0U;
-        }
-    }
-
-    ctx->base->IFLAG1 = 0xFFFFFFFFU;
-    ctx->base->IFLAG2 = 0xFFFFFFFFU;
-    ctx->base->IMASK1 = 0U;
-    ctx->base->IMASK2 = 0U;
-
-    if (ctx->fdEnabled)
-    {
-        ctx->base->MB_64B.MB_64B_L[ONCHIP_TX_MB_INDEX].CS = CAN_CS_CODE(FLEXCAN_MB_CODE_TX_INACTIVE);
-        ctx->base->MB_64B.MB_64B_L[ONCHIP_TX_MB_INDEX].ID = 0U;
-        ctx->base->MB_64B.MB_64B_L[ONCHIP_RX_MB_INDEX].ID = 0U;
-        ctx->base->MB_64B.MB_64B_L[ONCHIP_RX_MB_INDEX].CS = CAN_CS_CODE(FLEXCAN_MB_CODE_RX_EMPTY);
-    }
-    else
-    {
-        ctx->base->MB[ONCHIP_TX_MB_INDEX].CS = CAN_CS_CODE(FLEXCAN_MB_CODE_TX_INACTIVE);
-        ctx->base->MB[ONCHIP_TX_MB_INDEX].ID = 0U;
-        ctx->base->MB[ONCHIP_TX_MB_INDEX].WORD0 = 0U;
-        ctx->base->MB[ONCHIP_TX_MB_INDEX].WORD1 = 0U;
-        ctx->base->MB[ONCHIP_RX_MB_INDEX].ID = 0U;
-        ctx->base->MB[ONCHIP_RX_MB_INDEX].CS = CAN_CS_CODE(FLEXCAN_MB_CODE_RX_EMPTY);
-    }
-
-    ctx->config = *config;
-    ctx->ready = OnchipExitFreeze(ctx);
-    return ctx->ready;
-}
-
-static bool OnchipTxMailboxIdle(onchip_channel_ctx_t *ctx)
-{
-    uint32_t cs;
-    uint32_t code;
-
-    if (ctx->fdEnabled)
-    {
-        cs = ctx->base->MB_64B.MB_64B_L[ONCHIP_TX_MB_INDEX].CS;
-    }
-    else
-    {
-        cs = ctx->base->MB[ONCHIP_TX_MB_INDEX].CS;
-    }
-
-    if ((ctx->base->IFLAG1 & (1UL << ONCHIP_TX_MB_INDEX)) != 0U)
-    {
-        ctx->base->IFLAG1 = (1UL << ONCHIP_TX_MB_INDEX);
-        if (ctx->fdEnabled)
-        {
-            ctx->base->MB_64B.MB_64B_L[ONCHIP_TX_MB_INDEX].CS = CAN_CS_CODE(FLEXCAN_MB_CODE_TX_INACTIVE);
+            ctx->rxStdArmed = true;
         }
         else
         {
-            ctx->base->MB[ONCHIP_TX_MB_INDEX].CS = CAN_CS_CODE(FLEXCAN_MB_CODE_TX_INACTIVE);
+            ctx->rxExtArmed = true;
         }
         return true;
     }
 
-    code = (cs & CAN_CS_CODE_MASK) >> CAN_CS_CODE_SHIFT;
-    return (code == FLEXCAN_MB_CODE_TX_INACTIVE);
+    return false;
 }
 
-static bool OnchipTransmitFrame(onchip_channel_ctx_t *ctx, const can_frame_t *frame)
+static void OnchipPushRxEvent(onchip_channel_ctx_t *ctx, const can_frame_t *frame)
 {
-    uint8_t dlc;
-    uint8_t wordCount;
-    uint8_t i;
-    uint32_t words[16];
-    uint32_t cs;
-    bool extended;
-    bool fdFrame;
+    can_bus_event_t event;
 
-    if ((ctx == NULL) || (frame == NULL) || (!ctx->ready))
-    {
-        return false;
-    }
-
-    fdFrame = ((frame->flags & 0x01U) != 0U) && ctx->supportsFd && ctx->fdEnabled;
-    if ((!fdFrame) && (frame->dlc > 8U))
-    {
-        return false;
-    }
-
-    dlc = OnchipLengthToDlc(frame->dlc, fdFrame);
-    if (dlc == 0xFFU)
-    {
-        return false;
-    }
-    if (!OnchipTxMailboxIdle(ctx))
-    {
-        return false;
-    }
-
-    extended = (frame->id > 0x7FFU);
-    wordCount = (uint8_t)((frame->dlc + 3U) / 4U);
-    if (!fdFrame)
-    {
-        wordCount = 2U;
-    }
-    (void)memset(words, 0, sizeof(words));
-    for (i = 0U; i < frame->dlc; i++)
-    {
-        words[i / 4U] |= ((uint32_t)frame->data[i] << ((i % 4U) * 8U));
-    }
-
-    if (ctx->fdEnabled)
-    {
-        ctx->base->MB_64B.MB_64B_L[ONCHIP_TX_MB_INDEX].ID = OnchipEncodeId(frame->id, extended);
-    }
-    else
-    {
-        ctx->base->MB[ONCHIP_TX_MB_INDEX].ID = OnchipEncodeId(frame->id, extended);
-    }
-    OnchipWriteWords(ctx, ONCHIP_TX_MB_INDEX, words, wordCount);
-
-    cs = CAN_CS_CODE(FLEXCAN_MB_CODE_TX_DATA) | CAN_CS_DLC(dlc);
-    if (extended)
-    {
-        cs |= CAN_CS_IDE_MASK | CAN_CS_SRR_MASK;
-    }
-    if (fdFrame)
-    {
-        cs |= CAN_CS_EDL_MASK | CAN_CS_BRS_MASK;
-    }
-
-    if (ctx->fdEnabled)
-    {
-        ctx->base->MB_64B.MB_64B_L[ONCHIP_TX_MB_INDEX].CS = cs;
-    }
-    else
-    {
-        ctx->base->MB[ONCHIP_TX_MB_INDEX].CS = cs;
-    }
-
-    return true;
-}
-
-static void OnchipRearmRx(onchip_channel_ctx_t *ctx)
-{
-    if (ctx->fdEnabled)
-    {
-        ctx->base->MB_64B.MB_64B_L[ONCHIP_RX_MB_INDEX].ID = 0U;
-        ctx->base->MB_64B.MB_64B_L[ONCHIP_RX_MB_INDEX].CS = CAN_CS_CODE(FLEXCAN_MB_CODE_RX_EMPTY);
-    }
-    else
-    {
-        ctx->base->MB[ONCHIP_RX_MB_INDEX].ID = 0U;
-        ctx->base->MB[ONCHIP_RX_MB_INDEX].CS = CAN_CS_CODE(FLEXCAN_MB_CODE_RX_EMPTY);
-    }
-}
-
-static void OnchipPollReceive(onchip_channel_ctx_t *ctx)
-{
-    can_frame_t frame;
-    uint32_t cs;
-    uint32_t id;
-    uint32_t words[16];
-    uint8_t dlc;
-    uint8_t length;
-    uint8_t i;
-    bool extended;
-    bool fdFrame;
-
-    if ((ctx == NULL) || (!ctx->ready))
-    {
-        return;
-    }
-    if ((ctx->base->IFLAG1 & (1UL << ONCHIP_RX_MB_INDEX)) == 0U)
+    if ((ctx == NULL) || (frame == NULL))
     {
         return;
     }
 
-    if (ctx->fdEnabled)
-    {
-        cs = ctx->base->MB_64B.MB_64B_L[ONCHIP_RX_MB_INDEX].CS;
-        id = ctx->base->MB_64B.MB_64B_L[ONCHIP_RX_MB_INDEX].ID;
-    }
-    else
-    {
-        cs = ctx->base->MB[ONCHIP_RX_MB_INDEX].CS;
-        id = ctx->base->MB[ONCHIP_RX_MB_INDEX].ID;
-    }
+    (void)memset(&event, 0, sizeof(event));
+    event.type = kCanBusEvent_RxFrame;
+    event.frame = *frame;
+    event.rawStatus = FLEXCAN_GetStatusFlags(ctx->base);
 
-    extended = ((cs & CAN_CS_IDE_MASK) != 0U);
-    fdFrame = ((cs & CAN_CS_EDL_MASK) != 0U);
-    dlc = (uint8_t)((cs & CAN_CS_DLC_MASK) >> CAN_CS_DLC_SHIFT);
-    length = OnchipDlcToLength(dlc, fdFrame);
-
-    (void)memset(&frame, 0, sizeof(frame));
-    frame.id = OnchipDecodeId(id, extended);
-    frame.dlc = length;
-    frame.flags = fdFrame ? 0x01U : 0U;
-
-    (void)memset(words, 0, sizeof(words));
-    OnchipReadWords(ctx, ONCHIP_RX_MB_INDEX, words, ctx->fdEnabled ? 16U : 2U);
-    for (i = 0U; i < length; i++)
-    {
-        frame.data[i] = (uint8_t)((words[i / 4U] >> ((i % 4U) * 8U)) & 0xFFU);
-    }
-
-    (void)ctx->base->TIMER;
-    ctx->base->IFLAG1 = (1UL << ONCHIP_RX_MB_INDEX);
-    OnchipRearmRx(ctx);
-
-    {
-        uint32_t primask = EnterCritical();
-        (void)OnchipQueuePush(ctx->rxQueue, &ctx->rxHead, &ctx->rxTail, ONCHIP_RX_QUEUE_DEPTH, &frame);
-        ExitCritical(primask);
-    }
+    (void)OnchipQueueFramePush(ctx, frame);
+    (void)OnchipQueueEventPush(ctx, &event);
 }
 
-static void OnchipPollErrors(onchip_channel_ctx_t *ctx)
+static void OnchipPushTxCompleteEvent(onchip_channel_ctx_t *ctx)
 {
-    uint32_t esr1;
+    can_bus_event_t event;
 
-    if ((ctx == NULL) || (!ctx->ready))
+    if (ctx == NULL)
     {
         return;
     }
 
-    esr1 = ctx->base->ESR1;
-    ctx->lastEsr1 = esr1;
-    if ((esr1 & CAN_ESR1_BOFFINT_MASK) != 0U)
+    (void)memset(&event, 0, sizeof(event));
+    event.type = kCanBusEvent_TxComplete;
+    event.frame = ctx->lastTxFrame;
+    event.isTx = 1U;
+    event.rawStatus = FLEXCAN_GetStatusFlags(ctx->base);
+
+    (void)OnchipQueueEventPush(ctx, &event);
+}
+
+static void OnchipPushErrorEvent(onchip_channel_ctx_t *ctx, uint8_t errorCode, uint32_t rawStatus)
+{
+    can_bus_event_t event;
+
+    if ((ctx == NULL) || (errorCode == 0U))
     {
-        (void)TJA1042_NotifyBusState(
-            (ctx->channel == kCanChannel_Can2) ? kTja1042_CanFd2 :
-            (ctx->channel == kCanChannel_Can3) ? kTja1042_Can1 :
-                                                 kTja1042_Can2,
-            true);
+        return;
+    }
+
+    (void)memset(&event, 0, sizeof(event));
+    event.type = kCanBusEvent_Error;
+    event.frame = ctx->lastTxFrame;
+    event.errorCode = errorCode;
+    event.isTx = ctx->txPending ? 1U : 0U;
+    event.rawStatus = rawStatus;
+
+    (void)OnchipQueueEventPush(ctx, &event);
+}
+
+static void OnchipAbortSend(onchip_channel_ctx_t *ctx)
+{
+    if ((ctx == NULL) || (!ctx->txPending))
+    {
+        return;
+    }
+
+    if (OnchipUsesFdController(ctx))
+    {
+        FLEXCAN_TransferFDAbortSend(ctx->base, &ctx->handle, ONCHIP_TX_MB_INDEX);
+    }
+    else
+    {
+        FLEXCAN_TransferAbortSend(ctx->base, &ctx->handle, ONCHIP_TX_MB_INDEX);
+    }
+
+    ctx->txPending = false;
+    ctx->runtimeState.txPending = 0U;
+}
+
+static void OnchipHandleErrorStatus(onchip_channel_ctx_t *ctx, uint32_t rawStatus)
+{
+    uint8_t errorCode;
+    uint32_t previousErrorCode;
+
+    if (ctx == NULL)
+    {
+        return;
+    }
+
+    errorCode = OnchipMapEsr1ToErrorCode(rawStatus);
+    previousErrorCode = ctx->runtimeState.lastErrorCode;
+    ctx->runtimeState.lastErrorCode = errorCode;
+    OnchipRefreshRuntimeState(ctx, rawStatus);
+
+    if (errorCode == 0U)
+    {
+        ctx->lastErrorLatched = false;
+        return;
+    }
+
+    if ((!ctx->lastErrorLatched) || (previousErrorCode != errorCode))
+    {
+        OnchipPushErrorEvent(ctx, errorCode, rawStatus);
+    }
+
+    ctx->lastErrorLatched = true;
+
+    if (ctx->txPending)
+    {
+        OnchipAbortSend(ctx);
     }
 }
 
-bool CAN_InternalOnChipInit(void)
+static void OnchipConfigureMessageBuffers(onchip_channel_ctx_t *ctx)
 {
-    (void)memset(s_OnchipCtx, 0, sizeof(s_OnchipCtx));
+    flexcan_rx_mb_config_t rxConfig;
 
-    s_OnchipCtx[kCanChannel_Can2].base = CAN3;
-    s_OnchipCtx[kCanChannel_Can2].channel = kCanChannel_Can2;
-    s_OnchipCtx[kCanChannel_Can2].supportsFd = true;
+    if (ctx == NULL)
+    {
+        return;
+    }
 
-    s_OnchipCtx[kCanChannel_Can3].base = CAN1;
-    s_OnchipCtx[kCanChannel_Can3].channel = kCanChannel_Can3;
-    s_OnchipCtx[kCanChannel_Can3].supportsFd = false;
+    if (OnchipUsesFdController(ctx))
+    {
+        FLEXCAN_SetFDTxMbConfig(ctx->base, ONCHIP_TX_MB_INDEX, true);
+    }
+    else
+    {
+        FLEXCAN_SetTxMbConfig(ctx->base, ONCHIP_TX_MB_INDEX, true);
+    }
 
-    s_OnchipCtx[kCanChannel_Can4].base = CAN2;
-    s_OnchipCtx[kCanChannel_Can4].channel = kCanChannel_Can4;
-    s_OnchipCtx[kCanChannel_Can4].supportsFd = false;
+    (void)memset(&rxConfig, 0, sizeof(rxConfig));
+    rxConfig.id = FLEXCAN_ID_STD(0U);
+    rxConfig.format = kFLEXCAN_FrameFormatStandard;
+    rxConfig.type = kFLEXCAN_FrameTypeData;
+    if (OnchipUsesFdController(ctx))
+    {
+        FLEXCAN_SetFDRxMbConfig(ctx->base, ONCHIP_RX_STD_MB_INDEX, &rxConfig, true);
+    }
+    else
+    {
+        FLEXCAN_SetRxMbConfig(ctx->base, ONCHIP_RX_STD_MB_INDEX, &rxConfig, true);
+    }
 
-    return true;
+    rxConfig.id = FLEXCAN_ID_EXT(0U);
+    rxConfig.format = kFLEXCAN_FrameFormatExtend;
+    if (OnchipUsesFdController(ctx))
+    {
+        FLEXCAN_SetFDRxMbConfig(ctx->base, ONCHIP_RX_EXT_MB_INDEX, &rxConfig, true);
+    }
+    else
+    {
+        FLEXCAN_SetRxMbConfig(ctx->base, ONCHIP_RX_EXT_MB_INDEX, &rxConfig, true);
+    }
+
+    FLEXCAN_SetRxMbGlobalMask(ctx->base, 0U);
 }
 
-bool CAN_InternalOnChipApplyConfig(can_channel_t channel, const can_channel_config_t *config)
+static bool OnchipApplyControllerConfig(onchip_channel_ctx_t *ctx, const can_channel_config_t *config)
 {
-    onchip_channel_ctx_t *ctx = OnchipGetContext(channel);
+    flexcan_config_t controllerConfig;
+    flexcan_timing_config_t timingConfig;
+    can_channel_config_t appliedConfig;
+    uint32_t sourceClockHz;
+    bool enableBrs;
+    flexcan_mb_size_t mbSize;
 
     if ((ctx == NULL) || (config == NULL))
     {
@@ -906,11 +730,183 @@ bool CAN_InternalOnChipApplyConfig(can_channel_t channel, const can_channel_conf
         return false;
     }
 
-    ctx->txHead = 0U;
-    ctx->txTail = 0U;
-    ctx->rxHead = 0U;
-    ctx->rxTail = 0U;
-    return OnchipApplyHardwareConfig(ctx, config);
+    sourceClockHz = CLOCK_GetClockRootFreq(kCLOCK_CanClkRoot);
+    if (sourceClockHz == 0U)
+    {
+        return false;
+    }
+    if (!OnchipBuildTimingConfig(ctx, sourceClockHz, config, &timingConfig, &appliedConfig))
+    {
+        return false;
+    }
+
+    FLEXCAN_Deinit(ctx->base);
+    FLEXCAN_GetDefaultConfig(&controllerConfig);
+    controllerConfig.maxMbNum = 16U;
+    controllerConfig.enableLoopBack = false;
+    controllerConfig.enableListenOnlyMode = false;
+    controllerConfig.enableIndividMask = false;
+    controllerConfig.disableSelfReception = true;
+    controllerConfig.bitRate = appliedConfig.nominalBitrate;
+    controllerConfig.timingConfig = timingConfig;
+
+    if (OnchipUsesFdController(ctx))
+    {
+        if (config->frameFormat == kCanFrameFormat_Fd)
+        {
+            controllerConfig.bitRateFD = appliedConfig.dataBitrate;
+            enableBrs = (appliedConfig.dataBitrate != appliedConfig.nominalBitrate);
+            mbSize = kFLEXCAN_64BperMB;
+        }
+        else
+        {
+            controllerConfig.bitRateFD = appliedConfig.nominalBitrate;
+            enableBrs = false;
+            mbSize = kFLEXCAN_8BperMB;
+        }
+
+        FLEXCAN_FDInit(ctx->base, &controllerConfig, sourceClockHz, mbSize, enableBrs);
+    }
+    else
+    {
+        FLEXCAN_Init(ctx->base, &controllerConfig, sourceClockHz);
+    }
+
+    FLEXCAN_TransferCreateHandle(ctx->base, &ctx->handle, OnchipFlexcanCallback, ctx);
+    OnchipConfigureMessageBuffers(ctx);
+
+    ctx->activeConfig = appliedConfig;
+    ctx->runtimeState = (can_driver_runtime_state_t){0};
+    ctx->txPending = false;
+    ctx->rxStdArmed = false;
+    ctx->rxExtArmed = false;
+    ctx->lastErrorLatched = false;
+    OnchipResetQueues(ctx);
+    ctx->ready = true;
+
+    (void)OnchipStartReceive(ctx, ONCHIP_RX_STD_MB_INDEX);
+    (void)OnchipStartReceive(ctx, ONCHIP_RX_EXT_MB_INDEX);
+    OnchipRefreshRuntimeState(ctx, FLEXCAN_GetStatusFlags(ctx->base));
+    return true;
+}
+
+static FLEXCAN_CALLBACK(OnchipFlexcanCallback)
+{
+    onchip_channel_ctx_t *ctx = (onchip_channel_ctx_t *)userData;
+    uint32_t primask;
+
+    (void)base;
+    (void)handle;
+
+    if ((ctx == NULL) || (!ctx->ready))
+    {
+        return;
+    }
+
+    primask = OnchipEnterCritical();
+
+    switch (status)
+    {
+        case kStatus_FLEXCAN_RxIdle:
+            if (result == ONCHIP_RX_STD_MB_INDEX)
+            {
+                can_frame_t frame;
+
+                ctx->rxStdArmed = false;
+                if (OnchipUsesFdController(ctx))
+                {
+                    OnchipFdToFrame(&ctx->rxStdFdFrame, &frame);
+                }
+                else
+                {
+                    OnchipClassicToFrame(&ctx->rxStdFrame, &frame);
+                }
+                OnchipPushRxEvent(ctx, &frame);
+                (void)OnchipStartReceive(ctx, ONCHIP_RX_STD_MB_INDEX);
+            }
+            else if (result == ONCHIP_RX_EXT_MB_INDEX)
+            {
+                can_frame_t frame;
+
+                ctx->rxExtArmed = false;
+                if (OnchipUsesFdController(ctx))
+                {
+                    OnchipFdToFrame(&ctx->rxExtFdFrame, &frame);
+                }
+                else
+                {
+                    OnchipClassicToFrame(&ctx->rxExtFrame, &frame);
+                }
+                OnchipPushRxEvent(ctx, &frame);
+                (void)OnchipStartReceive(ctx, ONCHIP_RX_EXT_MB_INDEX);
+            }
+            break;
+
+        case kStatus_FLEXCAN_TxIdle:
+            if (result == ONCHIP_TX_MB_INDEX)
+            {
+                ctx->txPending = false;
+                ctx->runtimeState.lastErrorCode = 0U;
+                ctx->lastErrorLatched = false;
+                OnchipRefreshRuntimeState(ctx, FLEXCAN_GetStatusFlags(ctx->base));
+                OnchipPushTxCompleteEvent(ctx);
+            }
+            break;
+
+        case kStatus_FLEXCAN_ErrorStatus:
+            OnchipHandleErrorStatus(ctx, result);
+            break;
+
+        default:
+            break;
+    }
+
+    OnchipExitCritical(primask);
+}
+
+bool CAN_InternalOnChipInit(void)
+{
+    uint8_t index;
+
+    for (index = 0U; index < (uint8_t)kCanChannel_Count; index++)
+    {
+        onchip_channel_ctx_t *ctx = OnchipGetCtx((can_channel_t)index);
+
+        if (ctx != NULL)
+        {
+            OnchipResetRuntimeContext(ctx);
+        }
+    }
+
+    return true;
+}
+
+bool CAN_InternalOnChipApplyConfig(can_channel_t channel, const can_channel_config_t *config)
+{
+    onchip_channel_ctx_t *ctx = OnchipGetCtx(channel);
+
+    if ((ctx == NULL) || (config == NULL))
+    {
+        return false;
+    }
+
+    return OnchipApplyControllerConfig(ctx, config);
+}
+
+bool CAN_InternalOnChipGetAppliedConfig(can_channel_t channel, can_channel_config_t *config)
+{
+    onchip_channel_ctx_t *ctx = OnchipGetCtx(channel);
+    uint32_t primask;
+
+    if ((ctx == NULL) || (config == NULL) || (!ctx->ready))
+    {
+        return false;
+    }
+
+    primask = OnchipEnterCritical();
+    *config = ctx->activeConfig;
+    OnchipExitCritical(primask);
+    return true;
 }
 
 void CAN_InternalOnChipTask(void)
@@ -922,8 +918,7 @@ void CAN_InternalOnChipTask(void)
 
 void CAN_InternalOnChipTaskChannel(can_channel_t channel)
 {
-    onchip_channel_ctx_t *ctx = OnchipGetContext(channel);
-    can_frame_t frame;
+    onchip_channel_ctx_t *ctx = OnchipGetCtx(channel);
     uint32_t primask;
 
     if ((ctx == NULL) || (!ctx->ready))
@@ -931,58 +926,129 @@ void CAN_InternalOnChipTaskChannel(can_channel_t channel)
         return;
     }
 
-    OnchipPollReceive(ctx);
-    OnchipPollErrors(ctx);
-
-    primask = EnterCritical();
-    if (ctx->txHead == ctx->txTail)
+    primask = OnchipEnterCritical();
+    OnchipRefreshRuntimeState(ctx, FLEXCAN_GetStatusFlags(ctx->base));
+    if (!ctx->rxStdArmed)
     {
-        ExitCritical(primask);
-        return;
+        (void)OnchipStartReceive(ctx, ONCHIP_RX_STD_MB_INDEX);
     }
-    frame = ctx->txQueue[ctx->txTail];
-    if (OnchipTransmitFrame(ctx, &frame))
+    if (!ctx->rxExtArmed)
     {
-        ctx->txTail = (uint8_t)((ctx->txTail + 1U) % ONCHIP_TX_QUEUE_DEPTH);
+        (void)OnchipStartReceive(ctx, ONCHIP_RX_EXT_MB_INDEX);
     }
-    ExitCritical(primask);
+    OnchipExitCritical(primask);
 }
 
 bool CAN_InternalOnChipSend(can_channel_t channel, const can_frame_t *frame)
 {
-    onchip_channel_ctx_t *ctx = OnchipGetContext(channel);
+    onchip_channel_ctx_t *ctx = OnchipGetCtx(channel);
+    status_t status;
     uint32_t primask;
-    bool ok;
+    bool enableBrs;
 
     if ((ctx == NULL) || (frame == NULL) || (!ctx->ready))
     {
         return false;
     }
-
-    if ((!ctx->fdEnabled) && (frame->dlc > 8U))
+    if ((ctx->activeConfig.frameFormat == kCanFrameFormat_Classic) && (((frame->flags & CAN_BRIDGE_FLAG_CANFD) != 0U) || (frame->dlc > 8U)))
+    {
+        return false;
+    }
+    if ((ctx->activeConfig.frameFormat == kCanFrameFormat_Fd) && (!ctx->supportsFd))
     {
         return false;
     }
 
-    primask = EnterCritical();
-    ok = OnchipQueuePush(ctx->txQueue, &ctx->txHead, &ctx->txTail, ONCHIP_TX_QUEUE_DEPTH, frame);
-    ExitCritical(primask);
-    return ok;
+    primask = OnchipEnterCritical();
+    if (ctx->txPending)
+    {
+        OnchipExitCritical(primask);
+        return false;
+    }
+
+    ctx->lastTxFrame = *frame;
+    ctx->lastErrorLatched = false;
+
+    if (OnchipUsesFdController(ctx))
+    {
+        bool fdFrame = (ctx->activeConfig.frameFormat == kCanFrameFormat_Fd) && OnchipFrameIsFdPayload(frame);
+
+        enableBrs = (ctx->activeConfig.dataBitrate != ctx->activeConfig.nominalBitrate);
+        OnchipFrameToFd(frame, fdFrame, enableBrs, &ctx->txFdFrame);
+        ctx->txTransfer.mbIdx = ONCHIP_TX_MB_INDEX;
+        ctx->txTransfer.framefd = &ctx->txFdFrame;
+        ctx->txTransfer.frame = NULL;
+        status = FLEXCAN_TransferFDSendNonBlocking(ctx->base, &ctx->handle, &ctx->txTransfer);
+    }
+    else
+    {
+        OnchipFrameToClassic(frame, &ctx->txFrame);
+        ctx->txTransfer.mbIdx = ONCHIP_TX_MB_INDEX;
+        ctx->txTransfer.frame = &ctx->txFrame;
+        status = FLEXCAN_TransferSendNonBlocking(ctx->base, &ctx->handle, &ctx->txTransfer);
+    }
+
+    if (status == kStatus_Success)
+    {
+        ctx->txPending = true;
+        ctx->runtimeState.txPending = 1U;
+        OnchipExitCritical(primask);
+        return true;
+    }
+
+    OnchipExitCritical(primask);
+    return false;
 }
 
 bool CAN_InternalOnChipReceive(can_channel_t channel, can_frame_t *frame)
 {
-    onchip_channel_ctx_t *ctx = OnchipGetContext(channel);
-    uint32_t primask;
+    onchip_channel_ctx_t *ctx = OnchipGetCtx(channel);
     bool ok;
+    uint32_t primask;
 
-    if ((ctx == NULL) || (frame == NULL) || (!ctx->ready))
+    if ((ctx == NULL) || (frame == NULL))
     {
         return false;
     }
 
-    primask = EnterCritical();
-    ok = OnchipQueuePop(ctx->rxQueue, &ctx->rxHead, &ctx->rxTail, ONCHIP_RX_QUEUE_DEPTH, frame);
-    ExitCritical(primask);
+    primask = OnchipEnterCritical();
+    ok = OnchipQueueFramePop(ctx, frame);
+    OnchipRefreshRuntimeState(ctx, FLEXCAN_GetStatusFlags(ctx->base));
+    OnchipExitCritical(primask);
     return ok;
+}
+
+bool CAN_InternalOnChipPollEvent(can_channel_t channel, can_bus_event_t *event)
+{
+    onchip_channel_ctx_t *ctx = OnchipGetCtx(channel);
+    bool ok;
+    uint32_t primask;
+
+    if ((ctx == NULL) || (event == NULL))
+    {
+        return false;
+    }
+
+    primask = OnchipEnterCritical();
+    ok = OnchipQueueEventPop(ctx, event);
+    OnchipRefreshRuntimeState(ctx, FLEXCAN_GetStatusFlags(ctx->base));
+    OnchipExitCritical(primask);
+    return ok;
+}
+
+bool CAN_InternalOnChipGetRuntimeState(can_channel_t channel, can_driver_runtime_state_t *state)
+{
+    onchip_channel_ctx_t *ctx = OnchipGetCtx(channel);
+    uint32_t primask;
+
+    if ((ctx == NULL) || (state == NULL))
+    {
+        return false;
+    }
+
+    primask = OnchipEnterCritical();
+    OnchipRefreshRuntimeState(ctx, FLEXCAN_GetStatusFlags(ctx->base));
+    *state = ctx->runtimeState;
+    OnchipExitCritical(primask);
+    return true;
 }

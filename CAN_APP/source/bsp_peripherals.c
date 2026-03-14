@@ -235,12 +235,20 @@ void BSP_UpdateCanActivityLeds(uint32_t tickMs)
 
 static void BSP_InitCanPinMux(void)
 {
-    IOMUXC_SetPinMux(IOMUXC_GPIO_EMC_17_FLEXCAN1_TX, 0U);
-    IOMUXC_SetPinMux(IOMUXC_GPIO_EMC_18_FLEXCAN1_RX, 0U);
+    IOMUXC_SetPinMux(IOMUXC_GPIO_SD_B1_02_FLEXCAN1_TX, 0U);
+    IOMUXC_SetPinMux(IOMUXC_GPIO_SD_B1_03_FLEXCAN1_RX, 0U);
     IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B0_02_FLEXCAN2_TX, 0U);
     IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B0_03_FLEXCAN2_RX, 0U);
     IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B0_14_FLEXCAN3_TX, 0U);
     IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B0_15_FLEXCAN3_RX, 0U);
+
+    /* Route each FlexCAN RX input to the board's actual pad instead of the
+     * reset-default daisy source, otherwise the controller samples the wrong
+     * pin and TX can remain stuck pending forever.
+     */
+    IOMUXC->SELECT_INPUT[kIOMUXC_FLEXCAN1_RX_SELECT_INPUT] = IOMUXC_SELECT_INPUT_DAISY(0x0U);
+    IOMUXC->SELECT_INPUT[kIOMUXC_FLEXCAN2_RX_SELECT_INPUT] = IOMUXC_SELECT_INPUT_DAISY(0x1U);
+    IOMUXC->SELECT_INPUT_1[kIOMUXC_CANFD_IPP_IND_CANRX_SELECT_INPUT] = IOMUXC_SELECT_INPUT_1_DAISY(0x1U);
 }
 
 static void BSP_InitLpspi1PinMux(void)

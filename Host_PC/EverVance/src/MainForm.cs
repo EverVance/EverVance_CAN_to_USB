@@ -5190,7 +5190,7 @@ namespace EverVance
                     SetStatus(string.Format(CultureInfo.InvariantCulture, "CH{0} 配置已生效。", channel));
                     break;
                 case ProtocolStatusStagedOnly:
-                    SetStatus(string.Format(CultureInfo.InvariantCulture, "CH{0} 配置已缓存，并已应用使能/终端；位时序待底层驱动接入。", channel));
+                    SetStatus(string.Format(CultureInfo.InvariantCulture, "CH{0} 仅应用了立即可生效部分；当前回读值为设备实际运行配置，位时序尚未切换。", channel));
                     break;
                 case ProtocolStatusInvalid:
                     SetStatus(string.Format(CultureInfo.InvariantCulture, "CH{0} 配置被设备拒绝，请检查波特率/采样点范围。", channel));
@@ -5315,6 +5315,19 @@ namespace EverVance
             var flags = packet[3];
             var errorCode = (byte)((flags >> 4) & 0x0F);
             var id = (uint)(packet[4] | (packet[5] << 8) | (packet[6] << 16) | (packet[7] << 24));
+            if ((flags & PacketFlagError) != 0 && errorCode == 0x07)
+            {
+                return null;
+            }
+            if ((flags & PacketFlagError) != 0 &&
+                (flags & PacketFlagTx) == 0 &&
+                id == 0U &&
+                dlc == 0 &&
+                (errorCode == 0x06 || errorCode == 0x07))
+            {
+                return null;
+            }
+
             return new CanFrame
             {
                 Timestamp = DateTime.Now,

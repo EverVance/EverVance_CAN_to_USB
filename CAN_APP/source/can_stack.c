@@ -26,6 +26,8 @@ static bool s_StackReady;
 static can_channel_config_t s_ChannelConfigs[kCanChannel_Count];
 static can_channel_runtime_status_t s_RuntimeStatus[kCanChannel_Count];
 
+static bool CAN_StackIsNodeStateOnlyError(uint8_t errorCode);
+
 static const char *CAN_StackFrameFormatName(can_frame_format_t frameFormat)
 {
     return (frameFormat == kCanFrameFormat_Fd) ? "FD" : "CAN";
@@ -68,6 +70,11 @@ static void CAN_StackPrintConfig(const char *prefix, can_channel_t channel, cons
 static bool CAN_StackIsValidChannel(can_channel_t channel)
 {
     return ((uint8_t)channel < (uint8_t)kCanChannel_Count);
+}
+
+static bool CAN_StackChannelIsReady(can_channel_t channel)
+{
+    return CAN_StackIsValidChannel(channel) && (s_RuntimeStatus[channel].ready != 0U);
 }
 
 static tja1042_channel_t CAN_StackMapPhyChannel(can_channel_t channel)
@@ -185,26 +192,52 @@ static bool CAN_StackNormalizeConfig(can_channel_t channel, const can_channel_co
     return true;
 }
 
-static uint8_t CAN_StackApplyRuntimeSideEffects(can_channel_t channel, const can_channel_config_t *config)
+static void CAN_StackBuildEffectiveConfig(can_channel_t channel,
+                                          const can_channel_config_t *requested,
+                                          uint8_t status,
+                                          can_channel_config_t *effective)
+{
+    if ((requested == NULL) || (effective == NULL) || !CAN_StackIsValidChannel(channel))
+    {
+        return;
+    }
+
+    *effective = *requested;
+
+    /* If a driver can only partially apply a request, keep the externally
+     * visible config aligned with the controller's actual running state.
+     */
+    if ((channel == kCanChannel_CanFd1Ext) && (status == CAN_CFG_STATUS_STAGED_ONLY))
+    {
+        effective->frameFormat = kCanFrameFormat_Classic;
+        effective->nominalBitrate = 500000U;
+        effective->nominalSamplePointPermille = 800U;
+        effective->dataBitrate = 0U;
+        effective->dataSamplePointPermille = 0U;
+    }
+}
+
+static uint8_t CAN_StackApplyRuntimeSideEffects(can_channel_t channel,
+                                                const can_channel_config_t *config,
+                                                can_channel_config_t *appliedConfig)
 {
     uint8_t status = CAN_CFG_STATUS_OK;
     tja1042_status_t phyStatus;
+    can_channel_config_t driverAppliedConfig;
 
     if (!CAN_StackIsValidChannel(channel) || (config == NULL))
     {
         return CAN_CFG_STATUS_INVALID;
     }
 
-    (void)BSP_SetCanTermination(channel, config->terminationEnabled);
-    (void)TJA1042_SetMode(CAN_StackMapPhyChannel(channel), config->enabled ? kTja1042Mode_Normal : kTja1042Mode_Standby);
+    driverAppliedConfig = *config;
 
     if (channel == kCanChannel_CanFd1Ext)
     {
-        if ((config->nominalBitrate != 500000U) || (config->nominalSamplePointPermille != 800U) ||
-            ((config->frameFormat == kCanFrameFormat_Fd) &&
-             ((config->dataBitrate != 2000000U) || (config->dataSamplePointPermille != 750U))))
+        if (!CANFD1_ExtSpiApplyConfig(config))
         {
-            status = CAN_CFG_STATUS_STAGED_ONLY;
+            PRINTF("CAN cfg apply fail CH%u mcp2517fd apply rejected\r\n", (uint32_t)channel);
+            return CAN_CFG_STATUS_INVALID;
         }
     }
     else if (!CAN_InternalOnChipApplyConfig(channel, config))
@@ -212,19 +245,41 @@ static uint8_t CAN_StackApplyRuntimeSideEffects(can_channel_t channel, const can
         PRINTF("CAN cfg apply fail CH%u onchip apply rejected\r\n", (uint32_t)channel);
         return CAN_CFG_STATUS_INVALID;
     }
+    else if (!CAN_InternalOnChipGetAppliedConfig(channel, &driverAppliedConfig))
+    {
+        driverAppliedConfig = *config;
+    }
 
-    s_RuntimeStatus[channel].enabled = config->enabled ? 1U : 0U;
-    s_RuntimeStatus[channel].ready = s_StackReady ? 1U : 0U;
+    if (appliedConfig != NULL)
+    {
+        *appliedConfig = driverAppliedConfig;
+    }
+
+    (void)BSP_SetCanTermination(channel, driverAppliedConfig.terminationEnabled);
+    (void)TJA1042_SetMode(
+        CAN_StackMapPhyChannel(channel), driverAppliedConfig.enabled ? kTja1042Mode_Normal : kTja1042Mode_Standby);
+
+    s_RuntimeStatus[channel].enabled = driverAppliedConfig.enabled ? 1U : 0U;
+    s_RuntimeStatus[channel].ready = 1U;
+    s_RuntimeStatus[channel].busOff = 0U;
+    s_RuntimeStatus[channel].errorPassive = 0U;
+    s_RuntimeStatus[channel].lastErrorCode = 0U;
     if (TJA1042_GetStatus(CAN_StackMapPhyChannel(channel), &phyStatus))
     {
         s_RuntimeStatus[channel].phyStandby = (phyStatus.appliedMode == kTja1042Mode_Standby) ? 1U : 0U;
     }
 
-    PRINTF("CAN cfg applied CH%u status=%s ready=%u en=%u phyStandby=%u tx=%u rx=%u lastErr=0x%08X\r\n",
+    PRINTF("CAN cfg applied CH%u status=%s ready=%u en=%u fmt=%s term=%u n=%u/%u d=%u/%u phyStandby=%u tx=%u rx=%u lastErr=0x%08X\r\n",
            (uint32_t)channel,
            CAN_StackStatusName(status),
            s_RuntimeStatus[channel].ready,
            s_RuntimeStatus[channel].enabled,
+           CAN_StackFrameFormatName(driverAppliedConfig.frameFormat),
+           driverAppliedConfig.terminationEnabled ? 1U : 0U,
+           driverAppliedConfig.nominalBitrate,
+           driverAppliedConfig.nominalSamplePointPermille,
+           driverAppliedConfig.dataBitrate,
+           driverAppliedConfig.dataSamplePointPermille,
            s_RuntimeStatus[channel].phyStandby,
            s_RuntimeStatus[channel].txCount,
            s_RuntimeStatus[channel].rxCount,
@@ -237,6 +292,8 @@ bool CAN_StackInit(void)
 {
     uint32_t i;
     bool okPhy = TJA1042_Init();
+    bool okExt = CANFD1_ExtSpiInit();
+    bool okOnChip = CAN_InternalOnChipInit();
     (void)memset(s_RuntimeStatus, 0, sizeof(s_RuntimeStatus));
 #if defined(CAN_LOOPBACK_MODE) && (CAN_LOOPBACK_MODE == 1)
     (void)TJA1042_SetMode(kTja1042_CanFd1, kTja1042Mode_Standby);
@@ -246,14 +303,12 @@ bool CAN_StackInit(void)
 #endif
     /* 缁熶竴鍒濆鍖栧缃?CANFD 涓庣墖涓?CAN銆?*/
     {
-        bool okExt = CANFD1_ExtSpiInit();
-        bool okOnChip = CAN_InternalOnChipInit();
         s_StackReady = okPhy && okExt && okOnChip;
     }
 
     for (i = 0U; i < (uint32_t)kCanChannel_Count; i++)
     {
-        s_RuntimeStatus[i].ready = s_StackReady ? 1U : 0U;
+        s_RuntimeStatus[i].ready = 0U;
     }
 
     for (i = 0U; i < (uint32_t)kCanChannel_Count; i++)
@@ -273,6 +328,47 @@ void CAN_StackTask(void)
     CAN_InternalOnChipTask();
 }
 
+static void CAN_StackRefreshDriverRuntimeStatus(can_channel_t channel)
+{
+    can_driver_runtime_state_t driverState;
+    bool ok = false;
+    bool busOffBefore;
+
+    if (!CAN_StackIsValidChannel(channel))
+    {
+        return;
+    }
+
+    if (channel == kCanChannel_CanFd1Ext)
+    {
+        ok = CANFD1_ExtSpiGetRuntimeState(&driverState);
+    }
+    else
+    {
+        ok = CAN_InternalOnChipGetRuntimeState(channel, &driverState);
+    }
+
+    if (!ok)
+    {
+        return;
+    }
+
+    busOffBefore = (s_RuntimeStatus[channel].busOff != 0U);
+    s_RuntimeStatus[channel].busOff = driverState.busOff;
+    s_RuntimeStatus[channel].errorPassive = driverState.errorPassive;
+    s_RuntimeStatus[channel].rxPending = driverState.rxPending;
+    s_RuntimeStatus[channel].txPending = driverState.txPending;
+    if ((driverState.lastErrorCode != 0U) && !CAN_StackIsNodeStateOnlyError((uint8_t)driverState.lastErrorCode))
+    {
+        s_RuntimeStatus[channel].lastErrorCode = driverState.lastErrorCode;
+    }
+
+    if ((!busOffBefore) && (driverState.busOff != 0U))
+    {
+        (void)TJA1042_NotifyBusState(CAN_StackMapPhyChannel(channel), true);
+    }
+}
+
 void CAN_StackTaskChannel(can_channel_t channel)
 {
     tja1042_status_t phyStatus;
@@ -286,15 +382,19 @@ void CAN_StackTaskChannel(can_channel_t channel)
     if (channel == kCanChannel_CanFd1Ext)
     {
         CANFD1_ExtSpiTask();
+        CAN_StackRefreshDriverRuntimeStatus(channel);
         return;
     }
 
     CAN_InternalOnChipTaskChannel(channel);
+    CAN_StackRefreshDriverRuntimeStatus(channel);
 }
 
 bool CAN_StackApplyChannelConfig(can_channel_t channel, const can_channel_config_t *config, uint8_t *statusCode)
 {
     can_channel_config_t normalized;
+    can_channel_config_t applied;
+    can_channel_config_t effective;
     uint8_t status;
 
     if (statusCode != NULL)
@@ -313,12 +413,18 @@ bool CAN_StackApplyChannelConfig(can_channel_t channel, const can_channel_config
     }
 
     CAN_StackPrintConfig("CAN cfg req", channel, &normalized);
-    s_ChannelConfigs[channel] = normalized;
-    status = CAN_StackApplyRuntimeSideEffects(channel, &normalized);
+    status = CAN_StackApplyRuntimeSideEffects(channel, &normalized, &applied);
     if (statusCode != NULL)
     {
         *statusCode = status;
     }
+    if (status == CAN_CFG_STATUS_INVALID)
+    {
+        return false;
+    }
+
+    CAN_StackBuildEffectiveConfig(channel, &applied, status, &effective);
+    s_ChannelConfigs[channel] = effective;
 
     return true;
 }
@@ -340,6 +446,7 @@ bool CAN_StackGetChannelRuntimeStatus(can_channel_t channel, can_channel_runtime
     {
         return false;
     }
+    CAN_StackRefreshDriverRuntimeStatus(channel);
     *status = s_RuntimeStatus[channel];
     return true;
 }
@@ -350,11 +457,59 @@ uint32_t CAN_StackGetFeatureFlags(void)
            CAN_STACK_FEATURE_ONCHIP_CANFD | CAN_STACK_FEATURE_TERM_CTRL | CAN_STACK_FEATURE_PHY_STATE_MACHINE;
 }
 
+static bool CAN_StackIsNodeStateOnlyError(uint8_t errorCode)
+{
+    return (errorCode == 0x07U);
+}
+
+static void CAN_StackApplyEventRuntimeStatus(can_channel_t channel, const can_bus_event_t *event)
+{
+    if ((!CAN_StackIsValidChannel(channel)) || (event == NULL))
+    {
+        return;
+    }
+
+    switch (event->type)
+    {
+        case kCanBusEvent_RxFrame:
+            s_RuntimeStatus[channel].rxCount++;
+            break;
+
+        case kCanBusEvent_TxComplete:
+            s_RuntimeStatus[channel].txCount++;
+            s_RuntimeStatus[channel].lastErrorCode = 0U;
+            break;
+
+        case kCanBusEvent_Error:
+            if (!CAN_StackIsNodeStateOnlyError(event->errorCode))
+            {
+                s_RuntimeStatus[channel].lastErrorCode = event->errorCode;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    if (event->errorCode == 0x06U)
+    {
+        s_RuntimeStatus[channel].busOff = 1U;
+    }
+    else if (event->errorCode == 0x07U)
+    {
+        s_RuntimeStatus[channel].errorPassive = 1U;
+    }
+}
+
 bool CAN_StackSend(can_channel_t channel, const can_frame_t *frame)
 {
     const can_channel_config_t *cfg;
 
-    if ((s_StackReady == false) || (frame == NULL) || !CAN_StackIsValidChannel(channel))
+    if ((frame == NULL) || !CAN_StackIsValidChannel(channel))
+    {
+        return false;
+    }
+    if (!CAN_StackChannelIsReady(channel))
     {
         return false;
     }
@@ -371,26 +526,18 @@ bool CAN_StackSend(can_channel_t channel, const can_frame_t *frame)
 
     if (channel == kCanChannel_CanFd1Ext)
     {
-        if (CANFD1_ExtSpiSend(frame))
-        {
-            s_RuntimeStatus[channel].txCount++;
-            return true;
-        }
-        s_RuntimeStatus[channel].lastErrorCode = 0x08U;
-        return false;
+        return CANFD1_ExtSpiSend(frame);
     }
-    if (CAN_InternalOnChipSend(channel, frame))
-    {
-        s_RuntimeStatus[channel].txCount++;
-        return true;
-    }
-    s_RuntimeStatus[channel].lastErrorCode = 0x08U;
-    return false;
+    return CAN_InternalOnChipSend(channel, frame);
 }
 
 bool CAN_StackReceive(can_channel_t channel, can_frame_t *frame)
 {
-    if ((s_StackReady == false) || (frame == NULL) || !CAN_StackIsValidChannel(channel))
+    if ((frame == NULL) || !CAN_StackIsValidChannel(channel))
+    {
+        return false;
+    }
+    if (!CAN_StackChannelIsReady(channel))
     {
         return false;
     }
@@ -415,4 +562,37 @@ bool CAN_StackReceive(can_channel_t channel, can_frame_t *frame)
         return true;
     }
     return false;
+}
+
+bool CAN_StackPollEvent(can_channel_t channel, can_bus_event_t *event)
+{
+    bool ok;
+
+    if ((event == NULL) || !CAN_StackIsValidChannel(channel))
+    {
+        return false;
+    }
+    if (!CAN_StackChannelIsReady(channel))
+    {
+        return false;
+    }
+    if (!s_ChannelConfigs[channel].enabled)
+    {
+        return false;
+    }
+
+    if (channel == kCanChannel_CanFd1Ext)
+    {
+        ok = CANFD1_ExtSpiPollEvent(event);
+    }
+    else
+    {
+        ok = CAN_InternalOnChipPollEvent(channel, event);
+    }
+
+    if (ok)
+    {
+        CAN_StackApplyEventRuntimeStatus(channel, event);
+    }
+    return ok;
 }

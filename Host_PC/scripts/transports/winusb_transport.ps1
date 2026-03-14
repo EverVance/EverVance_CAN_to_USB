@@ -32,38 +32,45 @@ namespace VbaCan.Debug
             int vid;
             int pid;
             ParseEndpoint(endpoint, out vid, out pid);
-            string path = FindDevicePath(vid, pid);
-            if (string.IsNullOrWhiteSpace(path))
+            string[] paths = FindDevicePaths(vid, pid);
+            if (paths == null || paths.Length == 0)
             {
                 return false;
             }
 
-            _deviceHandle = Native.CreateFile(path, Native.GENERIC_READ | Native.GENERIC_WRITE,
-                Native.FILE_SHARE_READ | Native.FILE_SHARE_WRITE,
-                IntPtr.Zero, Native.OPEN_EXISTING,
-                Native.FILE_ATTRIBUTE_NORMAL | Native.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
-            if (_deviceHandle == null || _deviceHandle.IsInvalid)
+            for (int i = 0; i < paths.Length; i++)
             {
-                Close();
-                return false;
+                string path = paths[i];
+                _deviceHandle = Native.CreateFile(path, Native.GENERIC_READ | Native.GENERIC_WRITE,
+                    Native.FILE_SHARE_READ | Native.FILE_SHARE_WRITE,
+                    IntPtr.Zero, Native.OPEN_EXISTING,
+                    Native.FILE_ATTRIBUTE_NORMAL | Native.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+                if (_deviceHandle == null || _deviceHandle.IsInvalid)
+                {
+                    Close();
+                    continue;
+                }
+
+                if (!Native.WinUsb_Initialize(_deviceHandle, out _winUsbHandle))
+                {
+                    Close();
+                    continue;
+                }
+
+                if (!ResolveBulkPipes())
+                {
+                    Close();
+                    continue;
+                }
+
+                uint timeout = 2;
+                Native.WinUsb_SetPipePolicy(_winUsbHandle, _bulkIn, Native.PIPE_TRANSFER_TIMEOUT, 4, ref timeout);
+                Native.WinUsb_SetPipePolicy(_winUsbHandle, _bulkOut, Native.PIPE_TRANSFER_TIMEOUT, 4, ref timeout);
+                return true;
             }
 
-            if (!Native.WinUsb_Initialize(_deviceHandle, out _winUsbHandle))
-            {
-                Close();
-                return false;
-            }
-
-            if (!ResolveBulkPipes())
-            {
-                Close();
-                return false;
-            }
-
-            uint timeout = 2;
-            Native.WinUsb_SetPipePolicy(_winUsbHandle, _bulkIn, Native.PIPE_TRANSFER_TIMEOUT, 4, ref timeout);
-            Native.WinUsb_SetPipePolicy(_winUsbHandle, _bulkOut, Native.PIPE_TRANSFER_TIMEOUT, 4, ref timeout);
-            return true;
+            Close();
+            return false;
         }
 
         public void Close()
@@ -208,30 +215,41 @@ namespace VbaCan.Debug
             return true;
         }
 
-        private static string FindDevicePath(int vid, int pid)
+        private static string[] FindDevicePaths(int vid, int pid)
         {
+            var result = new List<string>();
             if (vid < 0 || pid < 0)
             {
                 vid = PreferredVid;
                 pid = PreferredPid;
             }
 
-            string path = FindDevicePathForGuid(VbaCanInterfaceGuid, vid, pid);
-            if (!string.IsNullOrWhiteSpace(path))
+            AppendUniquePath(result, FindDevicePathForGuid(VbaCanInterfaceGuid, vid, pid));
+            if (result.Count > 0)
             {
-                return path;
+                return result.ToArray();
             }
 
             foreach (Guid guid in EnumerateRegistryInterfaceGuids())
             {
-                path = FindDevicePathForGuid(guid, vid, pid);
-                if (!string.IsNullOrWhiteSpace(path))
-                {
-                    return path;
-                }
+                AppendUniquePath(result, FindDevicePathForGuid(guid, vid, pid));
             }
 
-            return FindDevicePathForGuid(Native.GUID_DEVINTERFACE_USB_DEVICE, vid, pid);
+            AppendUniquePath(result, FindDevicePathForGuid(Native.GUID_DEVINTERFACE_USB_DEVICE, vid, pid));
+            return result.ToArray();
+        }
+
+        private static void AppendUniquePath(List<string> paths, string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return;
+            }
+
+            if (!paths.Any(existing => string.Equals(existing, path, StringComparison.OrdinalIgnoreCase)))
+            {
+                paths.Add(path);
+            }
         }
 
         private static IEnumerable<Guid> EnumerateRegistryInterfaceGuids()

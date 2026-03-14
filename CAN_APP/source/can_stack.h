@@ -41,6 +41,7 @@ void CAN_StackTask(void);
 void CAN_StackTaskChannel(can_channel_t channel);
 bool CAN_StackSend(can_channel_t channel, const can_frame_t *frame);
 bool CAN_StackReceive(can_channel_t channel, can_frame_t *frame);
+bool CAN_StackPollEvent(can_channel_t channel, can_bus_event_t *event);
 void CAN_StackGetDefaultChannelConfig(can_channel_t channel, can_channel_config_t *config);
 bool CAN_StackApplyChannelConfig(can_channel_t channel, const can_channel_config_t *config, uint8_t *statusCode);
 bool CAN_StackGetChannelConfig(can_channel_t channel, can_channel_config_t *config);

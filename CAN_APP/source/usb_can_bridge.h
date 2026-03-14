@@ -37,5 +37,9 @@ void USB_CanBridgeRunRxStep(uint64_t tick);
 void USB_CanBridgeRunTxStep(TickType_t waitTicks);
 bool USB_CanBridgePostCanTxResult(const can_bridge_msg_t *txReq, bool sendOk, uint8_t errorCode);
 bool USB_CanBridgePostCanRxFrame(can_channel_t channel, const can_frame_t *rxFrame);
+bool USB_CanBridgePostCanError(can_channel_t channel,
+                               const can_frame_t *frameHint,
+                               bool isTx,
+                               uint8_t errorCode);
 
 #endif

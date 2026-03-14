@@ -358,41 +358,48 @@ namespace EverVance
             {
                 int vid, pid;
                 ParseWinUsbEndpoint(endpoint, out vid, out pid);
-                var path = FindWinUsbDevicePath(vid, pid);
-                if (string.IsNullOrWhiteSpace(path))
+                var paths = FindWinUsbDevicePaths(vid, pid);
+                if (paths.Count == 0)
                 {
                     return false;
                 }
 
-                _deviceHandle = Native.CreateFile(path, Native.GENERIC_READ | Native.GENERIC_WRITE,
-                    Native.FILE_SHARE_READ | Native.FILE_SHARE_WRITE,
-                    IntPtr.Zero, Native.OPEN_EXISTING,
-                    Native.FILE_ATTRIBUTE_NORMAL | Native.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
-
-                if (_deviceHandle == null || _deviceHandle.IsInvalid)
+                for (int i = 0; i < paths.Count; i++)
                 {
-                    Close();
-                    return false;
+                    var path = paths[i];
+                    _deviceHandle = Native.CreateFile(path, Native.GENERIC_READ | Native.GENERIC_WRITE,
+                        Native.FILE_SHARE_READ | Native.FILE_SHARE_WRITE,
+                        IntPtr.Zero, Native.OPEN_EXISTING,
+                        Native.FILE_ATTRIBUTE_NORMAL | Native.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+
+                    if (_deviceHandle == null || _deviceHandle.IsInvalid)
+                    {
+                        Close();
+                        continue;
+                    }
+
+                    if (!Native.WinUsb_Initialize(_deviceHandle, out _winUsbHandle))
+                    {
+                        Close();
+                        continue;
+                    }
+
+                    if (!ResolveBulkPipes())
+                    {
+                        Close();
+                        continue;
+                    }
+
+                    uint timeout = 2;
+                    Native.WinUsb_SetPipePolicy(_winUsbHandle, _bulkIn, Native.PIPE_TRANSFER_TIMEOUT, 4, ref timeout);
+                    Native.WinUsb_SetPipePolicy(_winUsbHandle, _bulkOut, Native.PIPE_TRANSFER_TIMEOUT, 4, ref timeout);
+
+                    _name = "WinUSB";
+                    return true;
                 }
 
-                if (!Native.WinUsb_Initialize(_deviceHandle, out _winUsbHandle))
-                {
-                    Close();
-                    return false;
-                }
-
-                if (!ResolveBulkPipes())
-                {
-                    Close();
-                    return false;
-                }
-
-                uint timeout = 2;
-                Native.WinUsb_SetPipePolicy(_winUsbHandle, _bulkIn, Native.PIPE_TRANSFER_TIMEOUT, 4, ref timeout);
-                Native.WinUsb_SetPipePolicy(_winUsbHandle, _bulkOut, Native.PIPE_TRANSFER_TIMEOUT, 4, ref timeout);
-
-                _name = "WinUSB";
-                return true;
+                Close();
+                return false;
             }
             catch
             {
@@ -591,9 +598,10 @@ namespace EverVance
             return dft;
         }
 
-        private static string FindWinUsbDevicePath(int vid, int pid)
+        private static List<string> FindWinUsbDevicePaths(int vid, int pid)
         {
             var devices = EnumeratePresentDevices();
+            var paths = new List<string>();
 
             if (vid >= 0 && pid >= 0)
             {
@@ -602,10 +610,10 @@ namespace EverVance
                     var d = devices[i];
                     if (d.Vid == vid && d.Pid == pid)
                     {
-                        return d.DevicePath;
+                        AppendUniquePath(paths, d.DevicePath);
                     }
                 }
-                return null;
+                return paths;
             }
 
             for (int i = 0; i < devices.Count; i++)
@@ -613,16 +621,34 @@ namespace EverVance
                 var d = devices[i];
                 if (d.Vid == PreferredVid && d.Pid == PreferredPid)
                 {
-                    return d.DevicePath;
+                    AppendUniquePath(paths, d.DevicePath);
                 }
+            }
+
+            if (paths.Count > 0)
+            {
+                return paths;
             }
 
             if (devices.Count == 1)
             {
-                return devices[0].DevicePath;
+                AppendUniquePath(paths, devices[0].DevicePath);
             }
 
-            return null;
+            return paths;
+        }
+
+        private static void AppendUniquePath(List<string> paths, string devicePath)
+        {
+            if (string.IsNullOrWhiteSpace(devicePath))
+            {
+                return;
+            }
+
+            if (!paths.Any(existing => string.Equals(existing, devicePath, StringComparison.OrdinalIgnoreCase)))
+            {
+                paths.Add(devicePath);
+            }
         }
 
         private static void ExtractVidPid(string path, out int vid, out int pid)

@@ -150,6 +150,33 @@ static uint8_t USB_CanBridgeClampU32ToU8(uint32_t value)
     return (value > 0xFFU) ? 0xFFU : (uint8_t)value;
 }
 
+static bool USB_CanBridgeIsNodeStateOnlyError(uint8_t errorCode)
+{
+    return (errorCode == 0x07U);
+}
+
+static bool USB_CanBridgeIsStateOnlyError(const can_frame_t *frameHint, bool isTx, uint8_t errorCode)
+{
+    if (USB_CanBridgeIsNodeStateOnlyError(errorCode))
+    {
+        return true;
+    }
+    if (isTx)
+    {
+        return false;
+    }
+    if (errorCode != 0x06U)
+    {
+        return false;
+    }
+    if (frameHint == NULL)
+    {
+        return true;
+    }
+
+    return (frameHint->id == 0U) && (frameHint->dlc == 0U) && (frameHint->flags == 0U);
+}
+
 static void USB_CanBridgeNoteHostActivity(TickType_t tick)
 {
     taskENTER_CRITICAL();
@@ -210,6 +237,25 @@ static void USB_CanBridgeDecrementUsbDataPending(uint8_t channel)
     taskEXIT_CRITICAL();
 }
 
+static void USB_CanBridgeDropUsbDataPending(uint8_t channel, uint16_t count)
+{
+    if ((channel >= (uint8_t)kCanChannel_Count) || (count == 0U))
+    {
+        return;
+    }
+
+    taskENTER_CRITICAL();
+    if (s_UsbDataPending[channel] > count)
+    {
+        s_UsbDataPending[channel] = (uint16_t)(s_UsbDataPending[channel] - count);
+    }
+    else
+    {
+        s_UsbDataPending[channel] = 0U;
+    }
+    taskEXIT_CRITICAL();
+}
+
 static uint8_t USB_CanBridgeGetUsbDataPending(uint8_t channel)
 {
     uint16_t pending = 0U;
@@ -223,6 +269,54 @@ static uint8_t USB_CanBridgeGetUsbDataPending(uint8_t channel)
     pending = s_UsbDataPending[channel];
     taskEXIT_CRITICAL();
     return (pending > 0xFFU) ? 0xFFU : (uint8_t)pending;
+}
+
+static void USB_CanBridgeFlushChannelQueues(uint8_t channel)
+{
+    can_bridge_msg_t canMsg;
+    usb_can_bridge_packet_t packet;
+    UBaseType_t pendingCount;
+    UBaseType_t index;
+    uint16_t removedUplink = 0U;
+
+    if (channel >= (uint8_t)kCanChannel_Count)
+    {
+        return;
+    }
+
+    if (s_CanTxQueues[channel] != NULL)
+    {
+        while (xQueueReceive(s_CanTxQueues[channel], &canMsg, 0U) == pdPASS)
+        {
+            s_CanTxDropped[channel]++;
+        }
+    }
+
+    if (s_UsbDataTxQueue == NULL)
+    {
+        return;
+    }
+
+    vTaskSuspendAll();
+    pendingCount = uxQueueMessagesWaiting(s_UsbDataTxQueue);
+    for (index = 0U; index < pendingCount; index++)
+    {
+        if (xQueueReceive(s_UsbDataTxQueue, &packet, 0U) != pdPASS)
+        {
+            break;
+        }
+
+        if (packet.channel == channel)
+        {
+            removedUplink++;
+            continue;
+        }
+
+        (void)xQueueSendToBack(s_UsbDataTxQueue, &packet, 0U);
+    }
+    (void)xTaskResumeAll();
+
+    USB_CanBridgeDropUsbDataPending(channel, removedUplink);
 }
 
 static bool USB_CanBridgeQueueControlPacket(const uint8_t *packet, uint32_t length)
@@ -630,6 +724,10 @@ static bool USB_CanBridgeHandleChannelConfigPacket(const uint8_t *packet, uint32
     if (!CAN_StackApplyChannelConfig((can_channel_t)channel, &requested, &status))
     {
         status = CAN_BRIDGE_CFG_STATUS_INVALID;
+    }
+    else if ((status == CAN_BRIDGE_CFG_STATUS_OK) || (status == CAN_BRIDGE_CFG_STATUS_STAGED_ONLY))
+    {
+        USB_CanBridgeFlushChannelQueues(channel);
     }
 
     return USB_CanBridgeRespondChannelConfig(channel, CAN_BRIDGE_CMD_SET_CHANNEL_CONFIG, status, packet[6]);
@@ -1102,10 +1200,14 @@ bool USB_CanBridgePostCanTxResult(const can_bridge_msg_t *txReq, bool sendOk, ui
 
     if (sendOk)
     {
-        return true;
+        CAN_BridgeBuildTxEcho(txReq, &uplinkMsg);
     }
     else
     {
+        if (USB_CanBridgeIsNodeStateOnlyError(errorCode))
+        {
+            return true;
+        }
         CAN_BridgeBuildError(txReq->channel, txReq->frame.id, txReq->frame.flags, true, errorCode, &uplinkMsg);
     }
 
@@ -1122,5 +1224,29 @@ bool USB_CanBridgePostCanRxFrame(can_channel_t channel, const can_frame_t *rxFra
     }
 
     CAN_BridgeBuildRxUplink(channel, rxFrame, &uplinkMsg);
+    return USB_CanBridgeQueueCanMessage(&uplinkMsg);
+}
+
+bool USB_CanBridgePostCanError(can_channel_t channel, const can_frame_t *frameHint, bool isTx, uint8_t errorCode)
+{
+    can_bridge_msg_t uplinkMsg;
+    uint32_t id = 0U;
+    uint8_t baseFlags = 0U;
+
+    if (s_UsbDataTxQueue == NULL)
+    {
+        return false;
+    }
+    if (USB_CanBridgeIsStateOnlyError(frameHint, isTx, errorCode))
+    {
+        return true;
+    }
+    if (frameHint != NULL)
+    {
+        id = frameHint->id;
+        baseFlags = frameHint->flags;
+    }
+
+    CAN_BridgeBuildError(channel, id, baseFlags, isTx, errorCode, &uplinkMsg);
     return USB_CanBridgeQueueCanMessage(&uplinkMsg);
 }

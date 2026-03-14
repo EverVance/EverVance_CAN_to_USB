@@ -28,6 +28,7 @@ static void CAN_ChannelTask(void *arg);
 static void Monitor_Task(void *arg);
 static void Startup_Task(void *arg);
 static void RTOS_UpdateStatusLeds(uint32_t tickMs);
+static uint8_t RTOS_GetChannelSendFailureCode(can_channel_t channel);
 
 static void RTOS_FatalLoop(const char *reason)
 {
@@ -76,6 +77,18 @@ static void RTOS_UpdateStatusLeds(uint32_t tickMs)
     BSP_SetStatusLed(kBspStatusLed6, USB_CanBridgeIsHostConnected());
 }
 
+static uint8_t RTOS_GetChannelSendFailureCode(can_channel_t channel)
+{
+    can_channel_runtime_status_t status;
+
+    if (CAN_StackGetChannelRuntimeStatus(channel, &status))
+    {
+        return (uint8_t)(status.lastErrorCode & 0xFFU);
+    }
+
+    return 0U;
+}
+
 static void USB_Task(void *arg)
 {
     TickType_t lastWakeTime;
@@ -103,7 +116,7 @@ static void CAN_ChannelTask(void *arg)
     can_channel_t channel = (can_channel_t)(uintptr_t)arg;
     QueueHandle_t q;
     can_bridge_msg_t msg;
-    can_frame_t rxFrame;
+    can_bus_event_t event;
     bool sendOk;
     uint32_t tickMs;
 
@@ -118,27 +131,41 @@ static void CAN_ChannelTask(void *arg)
         if ((q != NULL) && (xQueueReceive(q, &msg, pdMS_TO_TICKS(10)) == pdPASS))
         {
             sendOk = CAN_StackSend(msg.channel, &msg.frame);
-            tickMs = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-            if (sendOk)
+            if (!sendOk)
             {
-                BSP_NotifyCanTxActivity(msg.channel, tickMs);
+                (void)USB_CanBridgePostCanTxResult(&msg, false, RTOS_GetChannelSendFailureCode(msg.channel));
             }
-            (void)USB_CanBridgePostCanTxResult(&msg, sendOk, 0x8U);
-        }
-
-        while (CAN_StackReceive(channel, &rxFrame))
-        {
-            tickMs = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-            BSP_NotifyCanRxActivity(channel, tickMs);
-            (void)USB_CanBridgePostCanRxFrame(channel, &rxFrame);
         }
 
         CAN_StackTaskChannel(channel);
+
+        while (CAN_StackPollEvent(channel, &event))
+        {
+            tickMs = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            if (event.type == kCanBusEvent_RxFrame)
+            {
+                BSP_NotifyCanRxActivity(channel, tickMs);
+                (void)USB_CanBridgePostCanRxFrame(channel, &event.frame);
+            }
+            else if (event.type == kCanBusEvent_TxComplete)
+            {
+                BSP_NotifyCanTxActivity(channel, tickMs);
+                msg.channel = channel;
+                msg.frame = event.frame;
+                (void)USB_CanBridgePostCanTxResult(&msg, true, 0U);
+            }
+            else if (event.type == kCanBusEvent_Error)
+            {
+                (void)USB_CanBridgePostCanError(channel, &event.frame, event.isTx != 0U, event.errorCode);
+            }
+        }
     }
 }
 
 static void Monitor_Task(void *arg)
 {
+    can_channel_config_t ch0Config;
+    can_channel_runtime_status_t ch0Status;
     canfd1_ext_stats_t canfd1Stats;
     usb_can_bridge_stats_t bridgeStats;
     usb_vendor_bulk_stats_t usbStats;
@@ -156,7 +183,9 @@ static void Monitor_Task(void *arg)
 
         if ((int32_t)(xTaskGetTickCount() - nextLogTick) >= 0)
         {
-            PRINTF("rtos alive; usb cfg=%u host=%u rx=%u drop=%u tx=%u busy=%u | bridge ok=%u bad=%u ovf=%u ctrlPend=%u ctrlDrop=%u dataDrop=%u canPend=%u,%u,%u,%u usbPend=%u,%u,%u,%u canDrop=%u,%u,%u,%u usbDrop=%u,%u,%u,%u | canfd1 txDrop=%u txHwFail=%u rxDrop=%u\r\n",
+            (void)CAN_StackGetChannelConfig(kCanChannel_CanFd1Ext, &ch0Config);
+            (void)CAN_StackGetChannelRuntimeStatus(kCanChannel_CanFd1Ext, &ch0Status);
+            PRINTF("rtos alive; usb cfg=%u host=%u rx=%u drop=%u tx=%u busy=%u | bridge ok=%u bad=%u ovf=%u ctrlPend=%u ctrlDrop=%u dataDrop=%u canPend=%u,%u,%u,%u usbPend=%u,%u,%u,%u canDrop=%u,%u,%u,%u usbDrop=%u,%u,%u,%u | ch0 fmt=%s en=%u term=%u n=%u/%u d=%u/%u phy=%u bo=%u ep=%u lastErr=0x%08X | canfd1 txDrop=%u txHwFail=%u rxDrop=%u\r\n",
                    usbStats.configured,
                    USB_CanBridgeIsHostConnected() ? 1U : 0U,
                    usbStats.rxPackets,
@@ -185,6 +214,17 @@ static void Monitor_Task(void *arg)
                    bridgeStats.usbTxDropped[1],
                    bridgeStats.usbTxDropped[2],
                    bridgeStats.usbTxDropped[3],
+                   (ch0Config.frameFormat == kCanFrameFormat_Fd) ? "FD" : "CAN",
+                   ch0Config.enabled ? 1U : 0U,
+                   ch0Config.terminationEnabled ? 1U : 0U,
+                   ch0Config.nominalBitrate,
+                   ch0Config.nominalSamplePointPermille,
+                   ch0Config.dataBitrate,
+                   ch0Config.dataSamplePointPermille,
+                   ch0Status.phyStandby,
+                   ch0Status.busOff,
+                   ch0Status.errorPassive,
+                   (unsigned int)ch0Status.lastErrorCode,
                    canfd1Stats.txDropCount,
                    canfd1Stats.txHwFailCount,
                    canfd1Stats.rxDropCount);
