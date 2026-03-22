@@ -1,6 +1,10 @@
 #ifndef TJA1042_DRV_H
 #define TJA1042_DRV_H
 
+/* 文件说明：
+ * 本头文件封装板上 4 路 TJA1042 收发器的 STB 控制与 BusOff 恢复状态机。
+ * 它只负责“物理收发器模式”，不直接处理 CAN 协议层收发。 */
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -32,18 +36,26 @@ typedef struct
     uint32_t transitionCount;
     uint32_t lastModeChangeTickMs;
     uint32_t busOffRecoverAtTickMs;
+    uint32_t busOffRecoveryDelayMs;
+    uint8_t busOffRecoveryCount;
+    uint8_t reserved2;
+    uint8_t reserved3;
+    uint8_t reserved4;
 } tja1042_status_t;
 
-/* 初始化收发器控制层（依赖 BSP 已完成 GPIO 复用与输出配置）。 */
+/** 初始化收发器控制层（依赖 BSP 已完成 GPIO 复用与输出配置）。 */
 bool TJA1042_Init(void);
 
-/* 设置指定通道的 STB 模式。 */
+/** 设置指定收发器通道的 STB 模式。 */
 bool TJA1042_SetMode(tja1042_channel_t channel, tja1042_mode_t mode);
 
-/* 读取指定通道的当前模式缓存值。 */
+/** 读取指定通道当前缓存的工作模式。 */
 bool TJA1042_GetMode(tja1042_channel_t channel, tja1042_mode_t *mode);
+/** 周期推进 BusOff 恢复状态机。 */
 void TJA1042_Task(uint32_t tickMs);
+/** 通知收发器层当前总线是否进入 BusOff。 */
 bool TJA1042_NotifyBusState(tja1042_channel_t channel, bool busOff);
+/** 获取指定收发器通道的状态快照。 */
 bool TJA1042_GetStatus(tja1042_channel_t channel, tja1042_status_t *status);
 
 #endif

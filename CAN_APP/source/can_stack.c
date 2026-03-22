@@ -82,8 +82,16 @@ static tja1042_channel_t CAN_StackMapPhyChannel(can_channel_t channel)
     static const tja1042_channel_t s_PhyMap[kCanChannel_Count] = {
         kTja1042_CanFd1,
         kTja1042_CanFd2,
-        kTja1042_Can1,
+        /* 这是当前实物板上“逻辑通道 -> 实际生效 STB 控制对象”的映射。
+         *
+         * 2026-03-22 做过专门的实机对照：
+         * - 若按网表名义顺序恢复 CH2/CH3 的 STB 对应关系，
+         *   则“只开 CH0/CH2”会稳定复现 CH0 ACK Error、CH2 Bit Error/BusOff。
+         * - 恢复成当前顺序后，同样的 CH0/CH2 双通道回环可 12 秒压力 0 error。
+         *
+         * 因此这里记录的是“当前实板有效行为”，不是理论命名顺序。 */
         kTja1042_Can2,
+        kTja1042_Can1,
     };
 
     return s_PhyMap[channel];
@@ -173,6 +181,13 @@ static bool CAN_StackNormalizeConfig(can_channel_t channel, const can_channel_co
     }
 
     *normalized = *config;
+    if (!normalized->enabled)
+    {
+        /* 关闭通道时强制关闭板载终端。
+         * 否则 UI 上虽然显示“已关闭”，物理层上却还可能残留终端负载，
+         * 后续排查 ACK/Bit/BusOff 时会非常容易被误导。 */
+        normalized->terminationEnabled = false;
+    }
     if (normalized->frameFormat == kCanFrameFormat_Classic)
     {
         normalized->dataBitrate = 0U;
@@ -217,6 +232,21 @@ static void CAN_StackBuildEffectiveConfig(can_channel_t channel,
     }
 }
 
+static void CAN_StackBuildHostSessionResetConfig(can_channel_t channel, can_channel_config_t *config)
+{
+    if (config == NULL)
+    {
+        return;
+    }
+
+    CAN_StackGetDefaultChannelConfig(channel, config);
+    /* Host 会话级复位的语义是“回到统一的禁用态”，而不是恢复成默认启用。
+     * 这样每次重新连接后，四个通道都会从相同起点开始，只有真正收到配置的
+     * 通道才会重新进入工作状态。 */
+    config->enabled = false;
+    config->terminationEnabled = false;
+}
+
 static uint8_t CAN_StackApplyRuntimeSideEffects(can_channel_t channel,
                                                 const can_channel_config_t *config,
                                                 can_channel_config_t *appliedConfig)
@@ -230,6 +260,12 @@ static uint8_t CAN_StackApplyRuntimeSideEffects(can_channel_t channel,
         return CAN_CFG_STATUS_INVALID;
     }
 
+    /* 这里是设备侧最关键的分界点：
+     * 1. 先把配置真正落到 CAN 控制器
+     * 2. 再去切板级终端、切 STB、刷新运行态缓存
+     *
+     * 这样后续排查时就能明确知道，问题是出在控制器拒绝配置，
+     * 还是出在控制器已经配好但板级副作用没有跟上。 */
     driverAppliedConfig = *config;
 
     if (channel == kCanChannel_CanFd1Ext)
@@ -255,6 +291,10 @@ static uint8_t CAN_StackApplyRuntimeSideEffects(can_channel_t channel,
         *appliedConfig = driverAppliedConfig;
     }
 
+    /* 终端和 STB 是两条不同的板级控制链：
+     * - 终端：按逻辑通道直接控制
+     * - STB：必须先映射到真正对应的物理收发器
+     * 两者不能混为一谈。 */
     (void)BSP_SetCanTermination(channel, driverAppliedConfig.terminationEnabled);
     (void)TJA1042_SetMode(
         CAN_StackMapPhyChannel(channel), driverAppliedConfig.enabled ? kTja1042Mode_Normal : kTja1042Mode_Standby);
@@ -311,10 +351,14 @@ bool CAN_StackInit(void)
         s_RuntimeStatus[i].ready = 0U;
     }
 
+    /* 启动时先把四个通道都压到 Host 会话复位态，避免设备一上电就带着默认
+     * enabled=true 的状态在后台工作，给后续调试制造“历史残留”。 */
     for (i = 0U; i < (uint32_t)kCanChannel_Count; i++)
     {
         uint8_t ignoredStatus;
-        CAN_StackGetDefaultChannelConfig((can_channel_t)i, &s_ChannelConfigs[i]);
+        can_channel_config_t resetConfig;
+        CAN_StackBuildHostSessionResetConfig((can_channel_t)i, &resetConfig);
+        s_ChannelConfigs[i] = resetConfig;
         (void)CAN_StackApplyChannelConfig((can_channel_t)i, &s_ChannelConfigs[i], &ignoredStatus);
     }
 
@@ -363,9 +407,15 @@ static void CAN_StackRefreshDriverRuntimeStatus(can_channel_t channel)
         s_RuntimeStatus[channel].lastErrorCode = driverState.lastErrorCode;
     }
 
+    /* 只在 BusOff 状态发生边沿变化时通知收发器状态机，避免周期任务里重复
+     * 触发 Standby/恢复流程。 */
     if ((!busOffBefore) && (driverState.busOff != 0U))
     {
         (void)TJA1042_NotifyBusState(CAN_StackMapPhyChannel(channel), true);
+    }
+    else if (busOffBefore && (driverState.busOff == 0U))
+    {
+        (void)TJA1042_NotifyBusState(CAN_StackMapPhyChannel(channel), false);
     }
 }
 
@@ -429,6 +479,56 @@ bool CAN_StackApplyChannelConfig(can_channel_t channel, const can_channel_config
     return true;
 }
 
+bool CAN_StackRecoverChannel(can_channel_t channel)
+{
+    can_channel_config_t applied;
+    can_channel_config_t effective;
+    uint8_t status;
+
+    if (!CAN_StackIsValidChannel(channel))
+    {
+        return false;
+    }
+
+    status = CAN_StackApplyRuntimeSideEffects(channel, &s_ChannelConfigs[channel], &applied);
+    if (status == CAN_CFG_STATUS_INVALID)
+    {
+        return false;
+    }
+
+    CAN_StackBuildEffectiveConfig(channel, &applied, status, &effective);
+    s_ChannelConfigs[channel] = effective;
+    return true;
+}
+
+bool CAN_StackResetChannelToDefault(can_channel_t channel)
+{
+    can_channel_config_t defaultConfig;
+    uint8_t status;
+
+    if (!CAN_StackIsValidChannel(channel))
+    {
+        return false;
+    }
+
+    CAN_StackGetDefaultChannelConfig(channel, &defaultConfig);
+    return CAN_StackApplyChannelConfig(channel, &defaultConfig, &status);
+}
+
+bool CAN_StackResetChannelForHostSession(can_channel_t channel)
+{
+    can_channel_config_t resetConfig;
+    uint8_t status;
+
+    if (!CAN_StackIsValidChannel(channel))
+    {
+        return false;
+    }
+
+    CAN_StackBuildHostSessionResetConfig(channel, &resetConfig);
+    return CAN_StackApplyChannelConfig(channel, &resetConfig, &status);
+}
+
 bool CAN_StackGetChannelConfig(can_channel_t channel, can_channel_config_t *config)
 {
     if ((!CAN_StackIsValidChannel(channel)) || (config == NULL))
@@ -447,6 +547,17 @@ bool CAN_StackGetChannelRuntimeStatus(can_channel_t channel, can_channel_runtime
         return false;
     }
     CAN_StackRefreshDriverRuntimeStatus(channel);
+    *status = s_RuntimeStatus[channel];
+    return true;
+}
+
+bool CAN_StackPeekChannelRuntimeStatus(can_channel_t channel, can_channel_runtime_status_t *status)
+{
+    if ((!CAN_StackIsValidChannel(channel)) || (status == NULL))
+    {
+        return false;
+    }
+
     *status = s_RuntimeStatus[channel];
     return true;
 }

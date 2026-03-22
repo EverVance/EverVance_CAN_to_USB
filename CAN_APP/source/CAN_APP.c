@@ -18,6 +18,19 @@
 #include "bsp_peripherals.h"
 #include "rtos_app.h"
 
+/* 文件说明：
+ * 本文件只负责设备端启动编排：
+ * 1. 完成芯片与板级基础初始化
+ * 2. 打印启动诊断信息
+ * 3. 把控制权交给 RTOS 应用层
+ *
+ * 如果设备上电后完全不进入任务系统，优先从这里确认启动顺序。 */
+
+/* 设备端主入口。
+ * 启动顺序：
+ * 1. 板级时钟/引脚/调试串口
+ * 2. RTOS 应用启动
+ * 3. 进入调度器，不再返回 */
 int main(void)
 {
     BOARD_ConfigMPU();
@@ -38,7 +51,7 @@ int main(void)
            BOARD_BOOTCLOCKRUN_LPSPI_CLK_ROOT,
            BOARD_BOOTCLOCKRUN_FLEXSPI_CLK_ROOT,
            BOARD_BOOTCLOCKRUN_UART_CLK_ROOT);
-    PRINTF("CAN_APP debug uart=LPUART1@115200, LED4 untouched\r\n");
+    PRINTF("CAN_APP debug uart=LPUART1@115200, LED1-LED6 ready\r\n");
 
     RTOS_AppStart();
 

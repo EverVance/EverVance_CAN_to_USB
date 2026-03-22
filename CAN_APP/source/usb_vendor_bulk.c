@@ -13,6 +13,11 @@
 #include "usb_phy.h"
 #include "usb_spec.h"
 
+/* 文件说明：
+ * 本文件实现 USB Vendor Bulk 设备层运行逻辑。
+ * 它位于 NXP USB Device 栈之上、桥接层之下，负责枚举、端点收发以及 USB 侧状态维护。
+ * 如果现象是“设备枚举失败”“描述符异常”“Bulk 端点卡住”，优先看这里。 */
+
 #define USB_DEVICE_CONTROLLER_ID ((uint8_t)kUSB_ControllerEhci0)
 #define USB_BULK_BUFFER_SIZE (USB_VENDOR_BULK_EP_MAX_PACKET_SIZE_HS)
 #define USB_RX_RING_DEPTH (32U)
@@ -60,11 +65,13 @@ static uint32_t EnterCritical(void)
     return primask;
 }
 
+/* 退出临界区。 */
 static void ExitCritical(uint32_t primask)
 {
     __set_PRIMASK(primask);
 }
 
+/* 初始化 USB 设备时钟。 */
 static void USB_DeviceClockInit(void)
 {
     usb_phy_config_struct_t phyConfig = {
@@ -78,6 +85,7 @@ static void USB_DeviceClockInit(void)
     USB_EhciPhyInit(USB_DEVICE_CONTROLLER_ID, BOARD_XTAL0_CLK_HZ, &phyConfig);
 }
 
+/* 打开 USB 中断。 */
 static void USB_DeviceIsrEnable(void)
 {
     uint8_t irqNumber;
@@ -88,6 +96,7 @@ static void USB_DeviceIsrEnable(void)
     EnableIRQ((IRQn_Type)irqNumber);
 }
 
+/* 根据当前速率更新端点包长。 */
 static void USB_DeviceUpdateSpeed(usb_device_handle handle)
 {
     uint8_t speed = USB_SPEED_FULL;
@@ -107,6 +116,7 @@ static void USB_DeviceUpdateSpeed(usb_device_handle handle)
            USB_VendorBulkGetCurrentPacketSize());
 }
 
+/* 重置底层 USB 接收环形缓存。 */
 static void USB_RxRingReset(void)
 {
     uint32_t primask = EnterCritical();
@@ -158,6 +168,7 @@ static usb_status_t USB_BulkEndpointCallback(usb_device_handle handle,
     return kStatus_USB_Success;
 }
 
+/* 处理 SetConfiguration，标记设备是否真正进入 configured 状态。 */
 static usb_status_t USB_VendorBulkSetConfigure(usb_device_handle handle, uint8_t configure)
 {
     usb_device_endpoint_init_struct_t epInit;
@@ -206,6 +217,7 @@ static usb_status_t USB_VendorBulkSetConfigure(usb_device_handle handle, uint8_t
     return kStatus_USB_Success;
 }
 
+/* NXP USB 设备栈总回调。 */
 static usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *param)
 {
     usb_status_t status = kStatus_USB_Success;
@@ -339,6 +351,7 @@ static usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event,
     return status;
 }
 
+/* USB OTG 中断入口。 */
 void USB_OTG1_IRQHandler(void)
 {
     s_UsbIrqCount++;
@@ -349,6 +362,7 @@ void USB_OTG1_IRQHandler(void)
     __DSB();
 }
 
+/* USB Vendor Bulk 模块初始化入口。 */
 void USB_VendorBulkInit(void)
 {
     s_UsbDeviceHandle = NULL;
@@ -392,10 +406,12 @@ void USB_VendorBulkInit(void)
 #endif
 }
 
+/* USB 底层周期任务入口。 */
 void USB_VendorBulkTask(void)
 {
 }
 
+/* 用于把系统 tick 传入 USB 底层调试状态。 */
 void USB_VendorBulkUpdateHwTick(uint64_t tick)
 {
 #if ((defined(USB_DEVICE_CONFIG_REMOTE_WAKEUP)) && (USB_DEVICE_CONFIG_REMOTE_WAKEUP > 0U)) || \
@@ -410,11 +426,13 @@ void USB_VendorBulkUpdateHwTick(uint64_t tick)
 #endif
 }
 
+/* 查询 USB 是否处于 configured。 */
 bool USB_VendorBulkIsConfigured(void)
 {
     return (s_UsbDeviceHandle != NULL) && (s_CurrentConfiguration == USB_VENDOR_BULK_CONFIGURE_INDEX);
 }
 
+/* 读取底层统计。 */
 void USB_VendorBulkGetStats(usb_vendor_bulk_stats_t *stats)
 {
     uint32_t primask;
@@ -433,6 +451,7 @@ void USB_VendorBulkGetStats(usb_vendor_bulk_stats_t *stats)
     ExitCritical(primask);
 }
 
+/* 读取底层调试状态。 */
 void USB_VendorBulkGetDebugState(usb_vendor_bulk_debug_state_t *state)
 {
     uint32_t primask;
@@ -475,6 +494,7 @@ void USB_VendorBulkGetDebugState(usb_vendor_bulk_debug_state_t *state)
     ExitCritical(primask);
 }
 
+/* 从 USB 底层接收环中弹出一包。 */
 bool USB_VendorBulkPopRxPacket(uint8_t *data, uint32_t *length, uint32_t maxLength)
 {
     uint32_t primask;
@@ -508,6 +528,7 @@ bool USB_VendorBulkPopRxPacket(uint8_t *data, uint32_t *length, uint32_t maxLeng
     return true;
 }
 
+/* 向 USB IN 端点发送一包。 */
 bool USB_VendorBulkSendPacket(const uint8_t *data, uint32_t length)
 {
     uint32_t primask;

@@ -5,6 +5,10 @@
 #include "usb.h"
 #include "usb_spec.h"
 
+/* 文件说明：
+ * 本文件集中定义 USB Vendor Bulk 的设备描述符、配置描述符以及微软 OS 描述符支持。
+ * 它不处理业务数据，只负责让 PC 正确识别设备能力与驱动绑定方式。 */
+
 #define USB_VENDOR_ID (0x1FC9U)
 #define USB_PRODUCT_ID (0x0135U)
 #define USB_DEVICE_BCD (0x0101U)
@@ -221,17 +225,20 @@ static void USB_VendorBulkPatchConfigDescriptor(void)
     s_ConfigDescriptor[30] = (uint8_t)((packetSize >> 8U) & 0xFFU);
 }
 
+/* 根据当前速度切换描述符中的端点包长。 */
 void USB_VendorBulkSetSpeed(uint8_t speed)
 {
     s_CurrentSpeed = speed;
     USB_VendorBulkPatchConfigDescriptor();
 }
 
+/* 查询当前速度下的最大包长。 */
 uint16_t USB_VendorBulkGetCurrentPacketSize(void)
 {
     return (s_CurrentSpeed == USB_SPEED_HIGH) ? USB_VENDOR_BULK_EP_MAX_PACKET_SIZE_HS : USB_VENDOR_BULK_EP_MAX_PACKET_SIZE_FS;
 }
 
+/* NXP USB 描述符查询回调。 */
 usb_status_t USB_VendorBulkGetDescriptor(uint32_t event, void *param)
 {
     if (param == NULL)
@@ -308,6 +315,7 @@ usb_status_t USB_VendorBulkGetDescriptor(uint32_t event, void *param)
     }
 }
 
+/* 处理 Microsoft OS 兼容描述符请求，便于 WinUSB 绑定。 */
 bool USB_VendorBulkHandleMsOsVendorRequest(usb_setup_struct_t *setup, uint8_t **buffer, uint32_t *length)
 {
     if ((setup == NULL) || (buffer == NULL) || (length == NULL))

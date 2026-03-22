@@ -6,6 +6,16 @@
 #include "fsl_debug_console.h"
 #include "usb_vendor_bulk.h"
 
+/* 文件说明：
+ * 本文件实现 USB Bulk 与 CAN 子系统之间的桥接总控逻辑。
+ * 它负责：
+ * - 解析 Host 控制包/数据包
+ * - 投递到 CAN 栈
+ * - 把 TX/RX/错误结果重新编码回 USB
+ * - 维护 Host 会话状态和桥接统计
+ *
+ * 如果现象是“Host 看到的结果不对”或“连接/初始化/回执顺序异常”，优先查这里。 */
+
 #define CAN_BRIDGE_CFG_PROTO_VERSION (1U)
 #define CAN_BRIDGE_CMD_SET_CHANNEL_CONFIG (0x01U)
 #define CAN_BRIDGE_CMD_GET_CHANNEL_CONFIG (0x02U)
@@ -28,7 +38,6 @@
 #define USB_CAN_BRIDGE_CTRL_TX_QUEUE_DEPTH (16U)
 #define USB_CAN_BRIDGE_DATA_TX_QUEUE_DEPTH (128U)
 #define USB_CAN_BRIDGE_RX_STREAM_CAPACITY (1024U)
-#define USB_CAN_BRIDGE_HOST_LINK_TIMEOUT_MS (2000U)
 
 #define USB_VENDOR_ID_DEV (0x1FC9U)
 #define USB_PRODUCT_ID_DEV (0x0135U)
@@ -62,6 +71,9 @@ static uint32_t s_UsbTxDropped[kCanChannel_Count];
 static TickType_t s_HostActivityTick;
 static uint8_t s_HostConnected;
 
+static void USB_CanBridgeFlushChannelQueues(uint8_t channel);
+
+/* 控制命令码转字符串，仅用于串口调试输出。 */
 static const char *USB_CanBridgeCmdName(uint8_t command)
 {
     switch (command)
@@ -83,6 +95,7 @@ static const char *USB_CanBridgeCmdName(uint8_t command)
     }
 }
 
+/* 配置状态码转字符串，仅用于串口调试输出。 */
 static const char *USB_CanBridgeStatusName(uint8_t status)
 {
     switch (status)
@@ -100,11 +113,16 @@ static const char *USB_CanBridgeStatusName(uint8_t status)
     }
 }
 
+/* 帧格式转字符串，用于日志。 */
 static const char *USB_CanBridgeFrameFormatName(can_frame_format_t frameFormat)
 {
     return (frameFormat == kCanFrameFormat_Fd) ? "FD" : "CAN";
 }
 
+/* 打印控制命令日志。
+ * 维护提示：
+ * - 连接后“配置到底有没有下发”优先看这里。
+ * - 若 Host 与设备对配置回执理解不一致，也先从这里查。 */
 static void USB_CanBridgeLogControlCommand(const char *stage, uint8_t command, uint8_t channel, uint8_t sequence, uint32_t length)
 {
     PRINTF("USB ctrl %s cmd=%s(0x%02X) ch=%u seq=0x%02X len=%u\r\n",
@@ -116,6 +134,7 @@ static void USB_CanBridgeLogControlCommand(const char *stage, uint8_t command, u
            (unsigned int)length);
 }
 
+/* 小端写入 32bit，保持 USB 协议跨平台一致。 */
 static void USB_CanBridgeWriteU32Le(uint8_t *dst, uint32_t value)
 {
     dst[0] = (uint8_t)(value & 0xFFU);
@@ -124,37 +143,60 @@ static void USB_CanBridgeWriteU32Le(uint8_t *dst, uint32_t value)
     dst[3] = (uint8_t)((value >> 24U) & 0xFFU);
 }
 
+/* 小端写入 16bit。 */
 static void USB_CanBridgeWriteU16Le(uint8_t *dst, uint16_t value)
 {
     dst[0] = (uint8_t)(value & 0xFFU);
     dst[1] = (uint8_t)((value >> 8U) & 0xFFU);
 }
 
+/* 小端读取 32bit。 */
 static uint32_t USB_CanBridgeReadU32Le(const uint8_t *src)
 {
     return ((uint32_t)src[0]) | ((uint32_t)src[1] << 8U) | ((uint32_t)src[2] << 16U) | ((uint32_t)src[3] << 24U);
 }
 
+/* 小端读取 16bit。 */
 static uint16_t USB_CanBridgeReadU16Le(const uint8_t *src)
 {
     return (uint16_t)(((uint16_t)src[0]) | ((uint16_t)src[1] << 8U));
 }
 
+/* 将 RTOS 队列长度钳到单字节统计字段。 */
 static uint8_t USB_CanBridgeClampUBaseTypeToU8(UBaseType_t value)
 {
     return (value > 0xFFU) ? 0xFFU : (uint8_t)value;
 }
 
+/* 将 32bit 统计值钳到单字节展示字段。 */
 static uint8_t USB_CanBridgeClampU32ToU8(uint32_t value)
 {
     return (value > 0xFFU) ? 0xFFU : (uint8_t)value;
 }
 
+/* 判断错误码是否只表示“节点状态变化”，而非有意义的总线错误帧。 */
 static bool USB_CanBridgeIsNodeStateOnlyError(uint8_t errorCode)
 {
     return (errorCode == 0x07U);
 }
 
+/* 判断错误上报是否携带了有意义的帧上下文。 */
+static bool USB_CanBridgeHasMeaningfulFrameContext(const can_frame_t *frameHint)
+{
+    if (frameHint == NULL)
+    {
+        return false;
+    }
+
+    return (frameHint->id != 0U) ||
+           (frameHint->dlc != 0U) ||
+           ((frameHint->flags & CAN_BRIDGE_FLAG_CANFD) != 0U);
+}
+
+/* 判断是否应把某个错误视为“仅状态类错误”并过滤掉。
+ * 当前策略：
+ * - Error Passive 不进总线监控
+ * - 没有真实帧上下文的 RX 错误也不包装成 fake RX 0x000 */
 static bool USB_CanBridgeIsStateOnlyError(const can_frame_t *frameHint, bool isTx, uint8_t errorCode)
 {
     if (USB_CanBridgeIsNodeStateOnlyError(errorCode))
@@ -165,18 +207,14 @@ static bool USB_CanBridgeIsStateOnlyError(const can_frame_t *frameHint, bool isT
     {
         return false;
     }
-    if (errorCode != 0x06U)
-    {
-        return false;
-    }
-    if (frameHint == NULL)
-    {
-        return true;
-    }
 
-    return (frameHint->id == 0U) && (frameHint->dlc == 0U) && (frameHint->flags == 0U);
+    return !USB_CanBridgeHasMeaningfulFrameContext(frameHint);
 }
 
+/* 记录 Host 活跃时间。
+ * 说明：
+ * - 现在不再只靠心跳刷新，合法数据包/控制包也会刷新这里。
+ * - 这样可以避免高频数据场景被误判为“Host 已断开”。 */
 static void USB_CanBridgeNoteHostActivity(TickType_t tick)
 {
     taskENTER_CRITICAL();
@@ -185,6 +223,7 @@ static void USB_CanBridgeNoteHostActivity(TickType_t tick)
     taskEXIT_CRITICAL();
 }
 
+/* 清除 Host 活跃状态。 */
 static void USB_CanBridgeClearHostActivity(void)
 {
     taskENTER_CRITICAL();
@@ -193,6 +232,30 @@ static void USB_CanBridgeClearHostActivity(void)
     taskEXIT_CRITICAL();
 }
 
+/* 处理 Host 会话连断带来的桥接层状态刷新。
+ * 关键职责：
+ * - 清接收拼包缓存
+ * - 清各通道待发送队列
+ * - 清 USB 上行待发统计
+ * 这样可保证一次新会话从干净状态开始。 */
+void USB_CanBridgeHandleHostLinkState(bool connected)
+{
+    uint8_t channel;
+
+    if (!connected)
+    {
+        USB_CanBridgeClearHostActivity();
+    }
+
+    s_RxStreamLength = 0U;
+    (void)memset(s_UsbDataPending, 0, sizeof(s_UsbDataPending));
+    for (channel = 0U; channel < (uint8_t)kCanChannel_Count; channel++)
+    {
+        USB_CanBridgeFlushChannelQueues(channel);
+    }
+}
+
+/* 记录某一路 CAN TX 队列丢包。 */
 static void USB_CanBridgeNoteCanTxDrop(uint8_t channel)
 {
     if (channel < (uint8_t)kCanChannel_Count)
@@ -201,6 +264,7 @@ static void USB_CanBridgeNoteCanTxDrop(uint8_t channel)
     }
 }
 
+/* 记录某一路 USB 上行队列丢包。 */
 static void USB_CanBridgeNoteUsbTxDrop(uint8_t channel)
 {
     s_DataFramesDropped++;
@@ -210,6 +274,7 @@ static void USB_CanBridgeNoteUsbTxDrop(uint8_t channel)
     }
 }
 
+/* 增加某通道“待上行”的数据包计数。 */
 static void USB_CanBridgeIncrementUsbDataPending(uint8_t channel)
 {
     if (channel >= (uint8_t)kCanChannel_Count)
@@ -222,6 +287,7 @@ static void USB_CanBridgeIncrementUsbDataPending(uint8_t channel)
     taskEXIT_CRITICAL();
 }
 
+/* 成功发出一个 USB 上行包后，减少待发计数。 */
 static void USB_CanBridgeDecrementUsbDataPending(uint8_t channel)
 {
     if (channel >= (uint8_t)kCanChannel_Count)
@@ -237,6 +303,7 @@ static void USB_CanBridgeDecrementUsbDataPending(uint8_t channel)
     taskEXIT_CRITICAL();
 }
 
+/* 批量减少某通道待上行计数，用于清队列或丢弃残留数据。 */
 static void USB_CanBridgeDropUsbDataPending(uint8_t channel, uint16_t count)
 {
     if ((channel >= (uint8_t)kCanChannel_Count) || (count == 0U))
@@ -256,6 +323,7 @@ static void USB_CanBridgeDropUsbDataPending(uint8_t channel, uint16_t count)
     taskEXIT_CRITICAL();
 }
 
+/* 读取某通道当前待上行计数。 */
 static uint8_t USB_CanBridgeGetUsbDataPending(uint8_t channel)
 {
     uint16_t pending = 0U;
@@ -271,6 +339,9 @@ static uint8_t USB_CanBridgeGetUsbDataPending(uint8_t channel)
     return (pending > 0xFFU) ? 0xFFU : (uint8_t)pending;
 }
 
+/* 清空指定通道在桥接层上的残留队列。
+ * 维护提示：
+ * - 若出现“切换配置后还冒上一轮旧帧”，先看这里是否被调用。 */
 static void USB_CanBridgeFlushChannelQueues(uint8_t channel)
 {
     can_bridge_msg_t canMsg;
@@ -319,6 +390,7 @@ static void USB_CanBridgeFlushChannelQueues(uint8_t channel)
     USB_CanBridgeDropUsbDataPending(channel, removedUplink);
 }
 
+/* 将控制应答包压入 USB 控制上行队列。 */
 static bool USB_CanBridgeQueueControlPacket(const uint8_t *packet, uint32_t length)
 {
     usb_can_bridge_packet_t item;
@@ -341,6 +413,7 @@ static bool USB_CanBridgeQueueControlPacket(const uint8_t *packet, uint32_t leng
     return true;
 }
 
+/* 将一条 CAN 桥接消息编码后压入 USB 数据上行队列。 */
 static bool USB_CanBridgeQueueCanMessage(const can_bridge_msg_t *msg)
 {
     usb_can_bridge_packet_t item;
@@ -369,6 +442,8 @@ static bool USB_CanBridgeQueueCanMessage(const can_bridge_msg_t *msg)
     return true;
 }
 
+/* 丢弃接收拼包缓存的前缀字节。
+ * 用于从坏数据、错位数据中重新同步到下一帧起点。 */
 static void USB_CanBridgeDiscardRxPrefix(uint16_t count)
 {
     if (count >= s_RxStreamLength)
@@ -381,6 +456,7 @@ static void USB_CanBridgeDiscardRxPrefix(uint16_t count)
     s_RxStreamLength = (uint16_t)(s_RxStreamLength - count);
 }
 
+/* 将 USB 底层收到的一段原始字节追加到拼包缓存。 */
 static bool USB_CanBridgeAppendRxPacket(const uint8_t *packet, uint32_t length)
 {
     if ((packet == NULL) || (length == 0U))
@@ -404,6 +480,7 @@ static bool USB_CanBridgeAppendRxPacket(const uint8_t *packet, uint32_t length)
     return true;
 }
 
+/* 从拼包缓存中尝试提取一条完整协议帧。 */
 static bool USB_CanBridgeTryExtractRxFrame(uint8_t *packet, uint32_t *packetLength, uint32_t maxLength)
 {
     uint32_t expectedLength;
@@ -466,6 +543,7 @@ static bool USB_CanBridgeTryExtractRxFrame(uint8_t *packet, uint32_t *packetLeng
     return false;
 }
 
+/* 将通道配置编码成控制应答 payload。 */
 static uint32_t USB_CanBridgeBuildChannelConfigPayload(const can_channel_config_t *config, uint8_t *payload, uint32_t maxLength)
 {
     if ((config == NULL) || (payload == NULL) || (maxLength < CAN_BRIDGE_CFG_PAYLOAD_LEN))
@@ -484,6 +562,7 @@ static uint32_t USB_CanBridgeBuildChannelConfigPayload(const can_channel_config_
     return CAN_BRIDGE_CFG_PAYLOAD_LEN;
 }
 
+/* 将 Host 下发的配置 payload 解析为内部配置结构。 */
 static bool USB_CanBridgeParseChannelConfigPayload(const uint8_t *payload, uint32_t length, can_channel_config_t *config)
 {
     if ((payload == NULL) || (config == NULL) || (length != CAN_BRIDGE_CFG_PAYLOAD_LEN))
@@ -505,6 +584,7 @@ static bool USB_CanBridgeParseChannelConfigPayload(const uint8_t *payload, uint3
     return true;
 }
 
+/* 构造设备信息 payload。 */
 static uint32_t USB_CanBridgeBuildDeviceInfoPayload(uint8_t *payload, uint32_t maxLength)
 {
     if ((payload == NULL) || (maxLength < CAN_BRIDGE_DEVICE_INFO_PAYLOAD_LEN))
@@ -524,6 +604,7 @@ static uint32_t USB_CanBridgeBuildDeviceInfoPayload(uint8_t *payload, uint32_t m
     return CAN_BRIDGE_DEVICE_INFO_PAYLOAD_LEN;
 }
 
+/* 构造通道能力信息 payload。 */
 static uint32_t USB_CanBridgeBuildChannelCapsPayload(can_channel_t channel, uint8_t *payload, uint32_t maxLength)
 {
     can_channel_capabilities_t capabilities;
@@ -561,6 +642,9 @@ static uint32_t USB_CanBridgeBuildChannelCapsPayload(can_channel_t channel, uint
     return CAN_BRIDGE_CHANNEL_CAPS_PAYLOAD_LEN;
 }
 
+/* 构造运行态 payload。
+ * 注意：
+ * - 这里展示的是“桥接层补充后的运行态”，不仅仅是 CAN 控制器硬件状态。 */
 static uint32_t USB_CanBridgeBuildRuntimeStatusPayload(can_channel_t channel, uint8_t *payload, uint32_t maxLength)
 {
     can_channel_runtime_status_t status;
@@ -652,6 +736,7 @@ static bool USB_CanBridgeBuildControlPacket(uint8_t channel,
     return true;
 }
 
+/* 统一回复一个仅带状态码的控制响应。 */
 static bool USB_CanBridgeRespondControlStatus(uint8_t channel, uint8_t command, uint8_t status, uint8_t sequence)
 {
     uint8_t response[CAN_BRIDGE_USB_MAX_LEN];
@@ -665,6 +750,7 @@ static bool USB_CanBridgeRespondControlStatus(uint8_t channel, uint8_t command, 
     return USB_CanBridgeQueueControlPacket(response, responseLength);
 }
 
+/* 回复带配置 payload 的控制响应。 */
 static bool USB_CanBridgeRespondChannelConfig(uint8_t channel, uint8_t command, uint8_t status, uint8_t sequence)
 {
     uint8_t response[CAN_BRIDGE_USB_MAX_LEN];
@@ -700,6 +786,8 @@ static bool USB_CanBridgeRespondChannelConfig(uint8_t channel, uint8_t command, 
     return USB_CanBridgeQueueControlPacket(response, responseLength);
 }
 
+/* 处理 Host 下发的通道配置包。
+ * 这是“连接后设备初始化”最关键的入口之一。 */
 static bool USB_CanBridgeHandleChannelConfigPacket(const uint8_t *packet, uint32_t length)
 {
     can_channel_config_t requested;
@@ -733,6 +821,7 @@ static bool USB_CanBridgeHandleChannelConfigPacket(const uint8_t *packet, uint32
     return USB_CanBridgeRespondChannelConfig(channel, CAN_BRIDGE_CMD_SET_CHANNEL_CONFIG, status, packet[6]);
 }
 
+/* 处理“读取当前配置”控制包。 */
 static bool USB_CanBridgeHandleGetChannelConfigPacket(const uint8_t *packet, uint32_t length)
 {
     uint8_t channel;
@@ -752,6 +841,7 @@ static bool USB_CanBridgeHandleGetChannelConfigPacket(const uint8_t *packet, uin
     return USB_CanBridgeRespondChannelConfig(channel, CAN_BRIDGE_CMD_GET_CHANNEL_CONFIG, CAN_BRIDGE_CFG_STATUS_OK, packet[6]);
 }
 
+/* 处理“读取设备信息”控制包。 */
 static bool USB_CanBridgeHandleGetDeviceInfoPacket(const uint8_t *packet, uint32_t length)
 {
     uint8_t response[CAN_BRIDGE_USB_MAX_LEN];
@@ -776,6 +866,7 @@ static bool USB_CanBridgeHandleGetDeviceInfoPacket(const uint8_t *packet, uint32
     return USB_CanBridgeQueueControlPacket(response, responseLength);
 }
 
+/* 处理“读取通道能力”控制包。 */
 static bool USB_CanBridgeHandleGetChannelCapsPacket(const uint8_t *packet, uint32_t length)
 {
     uint8_t response[CAN_BRIDGE_USB_MAX_LEN];
@@ -817,6 +908,7 @@ static bool USB_CanBridgeHandleGetChannelCapsPacket(const uint8_t *packet, uint3
     return USB_CanBridgeQueueControlPacket(response, responseLength);
 }
 
+/* 处理“读取运行态”控制包。 */
 static bool USB_CanBridgeHandleGetRuntimeStatusPacket(const uint8_t *packet, uint32_t length)
 {
     uint8_t response[CAN_BRIDGE_USB_MAX_LEN];
@@ -861,6 +953,8 @@ static bool USB_CanBridgeHandleGetRuntimeStatusPacket(const uint8_t *packet, uin
     return USB_CanBridgeQueueControlPacket(response, responseLength);
 }
 
+/* 处理 Host 心跳包。
+ * 当前仍保留该命令，但 Host 活跃状态已不再只依赖心跳维持。 */
 static bool USB_CanBridgeHandleHeartbeatPacket(const uint8_t *packet, uint32_t length)
 {
     uint8_t response[CAN_BRIDGE_USB_MAX_LEN];
@@ -897,6 +991,7 @@ static bool USB_CanBridgeHandleHeartbeatPacket(const uint8_t *packet, uint32_t l
     return USB_CanBridgeQueueControlPacket(response, responseLength);
 }
 
+/* 消费一条控制包并路由到具体处理函数。 */
 static bool USB_CanBridgeConsumeControlPacket(const uint8_t *packet, uint32_t length, TickType_t tick)
 {
     if ((packet == NULL) || (length < 8U) || (packet[0] != CAN_BRIDGE_SYNC) || ((packet[3] & CAN_BRIDGE_FLAG_CONTROL) == 0U))
@@ -958,6 +1053,8 @@ static bool USB_CanBridgeConsumeControlPacket(const uint8_t *packet, uint32_t le
     }
 }
 
+/* 初始化 USB-CAN 桥接层。
+ * 这里只做软件资源分配，不主动驱动 USB/CAN 硬件进入工作态。 */
 bool USB_CanBridgeInit(void)
 {
     uint32_t i;
@@ -1003,10 +1100,9 @@ bool USB_CanBridgeInit(void)
     return true;
 }
 
+/* 查询当前是否认为 Host 会话已建立。 */
 bool USB_CanBridgeIsHostConnected(void)
 {
-    TickType_t nowTick;
-    TickType_t lastTick;
     uint8_t connected;
 
     if (!USB_VendorBulkIsConfigured())
@@ -1016,19 +1112,13 @@ bool USB_CanBridgeIsHostConnected(void)
     }
 
     taskENTER_CRITICAL();
-    lastTick = s_HostActivityTick;
     connected = s_HostConnected;
     taskEXIT_CRITICAL();
 
-    if (connected == 0U)
-    {
-        return false;
-    }
-
-    nowTick = xTaskGetTickCount();
-    return (nowTick - lastTick) <= pdMS_TO_TICKS(USB_CAN_BRIDGE_HOST_LINK_TIMEOUT_MS);
+    return (connected != 0U);
 }
 
+/* 获取某通道对应的 Host->CAN 发送队列句柄。 */
 QueueHandle_t USB_CanBridgeGetCanTxQueue(can_channel_t channel)
 {
     if ((uint8_t)channel >= (uint8_t)kCanChannel_Count)
@@ -1039,6 +1129,7 @@ QueueHandle_t USB_CanBridgeGetCanTxQueue(can_channel_t channel)
     return s_CanTxQueues[channel];
 }
 
+/* 输出桥接层统计，供串口日志与调试页读取。 */
 void USB_CanBridgeGetStats(usb_can_bridge_stats_t *stats)
 {
     uint32_t i;
@@ -1068,6 +1159,14 @@ void USB_CanBridgeGetStats(usb_can_bridge_stats_t *stats)
     }
 }
 
+/* USB 接收方向后台步骤。
+ * 调用上下文：
+ * - 由 USB_Task 周期调用
+ * 主要职责：
+ * - 从底层 USB Ring 取包
+ * - 拼包
+ * - 区分控制包与数据包
+ * - 将 Host TX 请求送入各通道队列 */
 void USB_CanBridgeRunRxStep(uint64_t tick)
 {
     uint8_t usbPacket[USB_VENDOR_BULK_MAX_PACKET];
@@ -1110,6 +1209,7 @@ void USB_CanBridgeRunRxStep(uint64_t tick)
                 continue;
             }
 
+            USB_CanBridgeNoteHostActivity(tickCount);
             q = USB_CanBridgeGetCanTxQueue(msg.channel);
             if ((q == NULL) || (xQueueSend(q, &msg, 0U) != pdPASS))
             {
@@ -1122,6 +1222,8 @@ void USB_CanBridgeRunRxStep(uint64_t tick)
     }
 }
 
+/* USB 发送方向后台步骤。
+ * 由专门的发送任务阻塞式调用，尽量减少忙轮询 CPU 占用。 */
 void USB_CanBridgeRunTxStep(TickType_t waitTicks)
 {
     usb_can_bridge_packet_t item;
@@ -1189,6 +1291,9 @@ void USB_CanBridgeRunTxStep(TickType_t waitTicks)
     }
 }
 
+/* 上报一条发送结果。
+ * sendOk=false 且 errorCode=0 表示“本地发送请求未成功进入控制器”，
+ * Host 侧应避免把它误渲染成总线层的 None 错误。 */
 bool USB_CanBridgePostCanTxResult(const can_bridge_msg_t *txReq, bool sendOk, uint8_t errorCode)
 {
     can_bridge_msg_t uplinkMsg;
@@ -1214,6 +1319,7 @@ bool USB_CanBridgePostCanTxResult(const can_bridge_msg_t *txReq, bool sendOk, ui
     return USB_CanBridgeQueueCanMessage(&uplinkMsg);
 }
 
+/* 上报一条接收到的总线帧。 */
 bool USB_CanBridgePostCanRxFrame(can_channel_t channel, const can_frame_t *rxFrame)
 {
     can_bridge_msg_t uplinkMsg;
@@ -1227,6 +1333,8 @@ bool USB_CanBridgePostCanRxFrame(can_channel_t channel, const can_frame_t *rxFra
     return USB_CanBridgeQueueCanMessage(&uplinkMsg);
 }
 
+/* 上报一条总线错误。
+ * 这里会先做“状态类错误过滤”，避免再次出现 fake RX 0x000。 */
 bool USB_CanBridgePostCanError(can_channel_t channel, const can_frame_t *frameHint, bool isTx, uint8_t errorCode)
 {
     can_bridge_msg_t uplinkMsg;

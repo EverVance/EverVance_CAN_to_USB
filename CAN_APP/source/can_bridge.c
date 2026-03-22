@@ -2,6 +2,10 @@
 
 #include <string.h>
 
+/* 文件说明：
+ * 本文件实现 USB 协议包与设备内部桥接消息之间的编码/解码。
+ * 它不关心具体 CAN 控制器，只负责协议边界的数据组织。 */
+
 bool CAN_BridgeDecodeUsb(const uint8_t *data, uint32_t length, can_bridge_msg_t *msg)
 {
     uint8_t dlc;
@@ -45,6 +49,7 @@ bool CAN_BridgeDecodeUsb(const uint8_t *data, uint32_t length, can_bridge_msg_t 
     return true;
 }
 
+/* 将统一桥接消息编码为 USB 协议帧。 */
 uint32_t CAN_BridgeEncodeUsb(const can_bridge_msg_t *msg, uint8_t *data, uint32_t maxLength)
 {
     uint32_t outLen;
@@ -85,6 +90,8 @@ uint32_t CAN_BridgeEncodeUsb(const can_bridge_msg_t *msg, uint8_t *data, uint32_
     return outLen;
 }
 
+/* 对 Host TX 请求做必要的规范化。
+ * 例如钳制 DLC、根据 ID 推断扩展帧等。 */
 bool CAN_BridgeNormalizeHostTx(can_bridge_msg_t *msg)
 {
     if (msg == NULL)
@@ -108,6 +115,7 @@ bool CAN_BridgeNormalizeHostTx(can_bridge_msg_t *msg)
     return true;
 }
 
+/* 构造发送回显消息。 */
 void CAN_BridgeBuildTxEcho(const can_bridge_msg_t *txReq, can_bridge_msg_t *msg)
 {
     if ((txReq == NULL) || (msg == NULL))
@@ -120,6 +128,7 @@ void CAN_BridgeBuildTxEcho(const can_bridge_msg_t *txReq, can_bridge_msg_t *msg)
     msg->frame.flags = (uint8_t)((txReq->frame.flags & CAN_BRIDGE_FLAG_CANFD) | CAN_BRIDGE_FLAG_TX);
 }
 
+/* 构造接收上行消息。 */
 void CAN_BridgeBuildRxUplink(can_channel_t channel, const can_frame_t *rxFrame, can_bridge_msg_t *msg)
 {
     if ((rxFrame == NULL) || (msg == NULL))
@@ -138,6 +147,7 @@ void CAN_BridgeBuildRxUplink(can_channel_t channel, const can_frame_t *rxFrame, 
     }
 }
 
+/* 构造错误上报消息。 */
 void CAN_BridgeBuildError(can_channel_t channel, uint32_t id, uint8_t baseFlags, bool isTx, uint8_t errorCode, can_bridge_msg_t *msg)
 {
     if (msg == NULL)

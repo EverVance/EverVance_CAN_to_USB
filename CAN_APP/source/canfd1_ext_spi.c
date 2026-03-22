@@ -8,6 +8,16 @@
 #include "fsl_debug_console.h"
 #include "lpspi1_bus.h"
 
+/* 文件说明：
+ * 本文件封装 CH0 外置 MCP2517FD 的主驱动逻辑。
+ * 它处于以下三层之间：
+ * - 下层：LPSPI1_Bus + Microchip 官方 drv_canfdspi
+ * - 中层：本文件负责配置、收发、事件和运行态
+ * - 上层：CAN Stack / USB_CAN_Bridge
+ *
+ * 如果现象只和 CH0 有关，或者涉及 TXQ / RX FIFO / TEF / BDIAG1 / TREC，
+ * 优先从本文件排查。 */
+
 #define MCP2517FD_ADDR_C1CON (0x000U)
 #define MCP2517FD_ADDR_C1NBTCFG (0x004U)
 #define MCP2517FD_ADDR_C1DBTCFG (0x008U)
@@ -43,6 +53,7 @@
 
 #define MCP2517FD_CAN_CLK_HZ (40000000U)
 #define MCP2517FD_T1_DLC_MASK (0x0FU)
+#define MCP2517FD_T1_IDE_MASK (0x10U)
 #define MCP2517FD_T1_BRS_MASK (0x40U)
 #define MCP2517FD_T1_FDF_MASK (0x80U)
 #define MCP2517FD_T1_SEQ_SHIFT (9U)
@@ -437,6 +448,7 @@ static void MCP2517FD_SetMsgId(CAN_MSGOBJ_ID *msgId, uint32_t id, bool extended)
     }
 }
 
+/* 从 MCP2517FD 的 ID 结构恢复统一逻辑 ID。 */
 static uint32_t MCP2517FD_GetMsgId(const CAN_MSGOBJ_ID *msgId, bool extended)
 {
     if (msgId == NULL)
@@ -452,6 +464,8 @@ static uint32_t MCP2517FD_GetMsgId(const CAN_MSGOBJ_ID *msgId, bool extended)
     return ((msgId->SID & 0x7FFU) << 18U) | (msgId->EID & 0x3FFFFU);
 }
 
+/* 将统一 can_frame_t 转换为官方驱动 TX 对象。
+ * 这里不写 payload，仅负责头字段和控制位。 */
 static void MCP2517FD_FrameToTxObject(const can_frame_t *frame, bool fdFrame, CAN_TX_MSGOBJ *txObj)
 {
     bool extended;
@@ -474,20 +488,23 @@ static void MCP2517FD_FrameToTxObject(const can_frame_t *frame, bool fdFrame, CA
     txObj->bF.timeStamp = 0U;
 }
 
+/* 将 RX FIFO 里的对象头和 payload 还原为统一帧格式。 */
 static void MCP2517FD_RxObjectToFrame(const CAN_RX_MSGOBJ *rxObj, const uint8_t *payload, can_frame_t *frame)
 {
     bool fdFrame;
     bool extended;
     uint8_t length;
+    uint32_t ctrlWord;
 
     if ((rxObj == NULL) || (frame == NULL))
     {
         return;
     }
 
-    fdFrame = (rxObj->bF.ctrl.FDF != 0U);
-    extended = (rxObj->bF.ctrl.IDE != 0U);
-    length = MCP2517FD_DlcToLength((uint8_t)rxObj->bF.ctrl.DLC, fdFrame);
+    ctrlWord = rxObj->word[1];
+    fdFrame = ((ctrlWord & MCP2517FD_T1_FDF_MASK) != 0U);
+    extended = ((ctrlWord & MCP2517FD_T1_IDE_MASK) != 0U);
+    length = MCP2517FD_DlcToLength((uint8_t)(ctrlWord & MCP2517FD_T1_DLC_MASK), fdFrame);
 
     (void)memset(frame, 0, sizeof(*frame));
     frame->id = MCP2517FD_GetMsgId(&rxObj->bF.id, extended);
@@ -499,25 +516,30 @@ static void MCP2517FD_RxObjectToFrame(const CAN_RX_MSGOBJ *rxObj, const uint8_t 
     }
 }
 
+/* 将 TEF 事件对象还原为统一帧描述。
+ * TEF 不含 payload，这里主要恢复 ID/DLC/FD 标志用于 TX 完成回显。 */
 static void MCP2517FD_TefObjectToFrame(const CAN_TEF_MSGOBJ *tefObj, can_frame_t *frame)
 {
     bool fdFrame;
     bool extended;
+    uint32_t ctrlWord;
 
     if ((tefObj == NULL) || (frame == NULL))
     {
         return;
     }
 
-    fdFrame = (tefObj->bF.ctrl.FDF != 0U);
-    extended = (tefObj->bF.ctrl.IDE != 0U);
+    ctrlWord = tefObj->word[1];
+    fdFrame = ((ctrlWord & MCP2517FD_T1_FDF_MASK) != 0U);
+    extended = ((ctrlWord & MCP2517FD_T1_IDE_MASK) != 0U);
 
     (void)memset(frame, 0, sizeof(*frame));
     frame->id = MCP2517FD_GetMsgId(&tefObj->bF.id, extended);
-    frame->dlc = MCP2517FD_DlcToLength((uint8_t)tefObj->bF.ctrl.DLC, fdFrame);
+    frame->dlc = MCP2517FD_DlcToLength((uint8_t)(ctrlWord & MCP2517FD_T1_DLC_MASK), fdFrame);
     frame->flags = fdFrame ? 0x01U : 0U;
 }
 
+/* 向软件事件队列压入 CH0 事件。 */
 static bool MCP2517FD_EventPush(const can_bus_event_t *event)
 {
     uint8_t nextHead;
@@ -542,6 +564,7 @@ static bool MCP2517FD_EventPush(const can_bus_event_t *event)
     return true;
 }
 
+/* 从官方诊断结构中取出 BDIAG1 原始位图。 */
 static uint32_t MCP2517FD_BusDiagToBits(const CAN_BUS_DIAGNOSTIC *diag)
 {
     if (diag == NULL)
@@ -552,6 +575,7 @@ static uint32_t MCP2517FD_BusDiagToBits(const CAN_BUS_DIAGNOSTIC *diag)
     return diag->word[1];
 }
 
+/* 将官方错误状态位图转换为本项目运行态使用的 TREC 风格位。 */
 static uint32_t MCP2517FD_ErrorStateToTrecBits(CAN_ERROR_STATE errorState)
 {
     uint32_t trec = 0U;
@@ -572,6 +596,10 @@ static uint32_t MCP2517FD_ErrorStateToTrecBits(CAN_ERROR_STATE errorState)
     return trec;
 }
 
+/* 根据 TXQ/BDIAG1/TREC 组合推断更接近根因的错误码。
+ * 优先级说明：
+ * - ACK/Bit/Stuff/CRC/Form 优先于 BusOff/ErrorPassive
+ * - 这样可以避免“最终进入 bus-off”覆盖掉真正的首发根因 */
 static uint8_t MCP2517FD_MapDiagToError(uint32_t txqsta, uint32_t bdiag1, uint32_t trec)
 {
     if ((bdiag1 & MCP2517FD_BDIAG1_NACKERR_MASK) != 0U)
@@ -615,6 +643,7 @@ static uint8_t MCP2517FD_MapDiagToError(uint32_t txqsta, uint32_t bdiag1, uint32
     return 0U;
 }
 
+/* 通过目标波特率和采样点搜索适配 MCP2517FD 的位时序寄存器。 */
 static bool MCP2517FD_CalcBitTiming(uint32_t bitrate,
                                     uint16_t samplePointPermille,
                                     uint32_t maxTqs,
@@ -690,6 +719,7 @@ static bool MCP2517FD_CalcBitTiming(uint32_t bitrate,
     return true;
 }
 
+/* 向 CH0 软件接收队列压入一帧。 */
 static __attribute__((unused)) bool MCP2517FD_RxQueuePush(const can_frame_t *frame)
 {
     uint8_t nextHead;
@@ -716,6 +746,7 @@ static __attribute__((unused)) bool MCP2517FD_RxQueuePush(const can_frame_t *fra
     return true;
 }
 
+/* SPI 读封装，统一限制传输长度与空指针检查。 */
 static bool MCP2517FD_SpiRead(uint16_t addr, uint8_t *data, size_t len)
 {
     if ((data == NULL) || (len == 0U) || (len > MCP2517FD_SPI_TRANSFER_MAX))
@@ -726,6 +757,7 @@ static bool MCP2517FD_SpiRead(uint16_t addr, uint8_t *data, size_t len)
     return (DRV_CANFDSPI_ReadByteArray(MCP2517FD_MODULE_ID, addr, data, (uint16_t)len) == 0);
 }
 
+/* SPI 写封装。 */
 static bool MCP2517FD_SpiWrite(uint16_t addr, const uint8_t *data, size_t len)
 {
     if ((data == NULL) || (len == 0U) || (len > MCP2517FD_SPI_TRANSFER_MAX))
@@ -736,6 +768,7 @@ static bool MCP2517FD_SpiWrite(uint16_t addr, const uint8_t *data, size_t len)
     return (DRV_CANFDSPI_WriteByteArray(MCP2517FD_MODULE_ID, addr, (uint8_t *)(uintptr_t)data, (uint16_t)len) == 0);
 }
 
+/* 读 8bit 寄存器。 */
 static bool MCP2517FD_Read8(uint16_t addr, uint8_t *value)
 {
     if (value == NULL)
@@ -746,11 +779,13 @@ static bool MCP2517FD_Read8(uint16_t addr, uint8_t *value)
     return (DRV_CANFDSPI_ReadByte(MCP2517FD_MODULE_ID, addr, value) == 0);
 }
 
+/* 写 8bit 寄存器。 */
 static bool MCP2517FD_Write8(uint16_t addr, uint8_t value)
 {
     return (DRV_CANFDSPI_WriteByte(MCP2517FD_MODULE_ID, addr, value) == 0);
 }
 
+/* 典型的寄存器读-改-写助手。 */
 static bool MCP2517FD_Modify8(uint16_t addr, uint8_t clearMask, uint8_t setMask)
 {
     uint8_t value;
@@ -763,6 +798,7 @@ static bool MCP2517FD_Modify8(uint16_t addr, uint8_t clearMask, uint8_t setMask)
     return MCP2517FD_Write8(addr, value);
 }
 
+/* 读 32bit 寄存器。 */
 static bool MCP2517FD_Read32(uint16_t addr, uint32_t *value)
 {
     if (value == NULL)
@@ -773,26 +809,34 @@ static bool MCP2517FD_Read32(uint16_t addr, uint32_t *value)
     return (DRV_CANFDSPI_ReadWord(MCP2517FD_MODULE_ID, addr, value) == 0);
 }
 
+/* 写 32bit 寄存器。 */
 static bool MCP2517FD_Write32(uint16_t addr, uint32_t value)
 {
     return (DRV_CANFDSPI_WriteWord(MCP2517FD_MODULE_ID, addr, value) == 0);
 }
 
+/* 根据统一帧标志判断是否使用 FD 格式发送。 */
 static bool MCP2517FD_FrameUsesFd(const can_frame_t *frame)
 {
     return ((frame != NULL) && ((frame->flags & 0x01U) != 0U));
 }
 
+/* 将控制器返回的 UA 转换成内部 RAM 绝对地址。 */
 static uint16_t MCP2517FD_RamAddrFromUa(uint32_t ua)
 {
     return (uint16_t)(MCP2517FD_RAM_ADDR_BASE + (ua & 0x07FFU));
 }
 
+/* 获取当前激活的 TX 对象大小。
+ * 维护注意：
+ * - 这是修复“经典 CAN 仍按 72 字节整块写入导致越界”的关键点之一。 */
 static uint8_t MCP2517FD_GetActiveTxObjectSize(void)
 {
     return (uint8_t)(MCP2517FD_MSG_OBJ_HEADER_SIZE + s_ActivePayloadSize);
 }
 
+/* 调试钩子：校验 TX 对象写入后的 RAM 内容。
+ * 当前默认留空，保留接口是为了后续继续硬件排查时可快速打开。 */
 static void MCP2517FD_DebugVerifyTxObjectWrite(uint16_t addr, const uint8_t *expected, uint8_t len)
 {
     (void)addr;
@@ -800,11 +844,13 @@ static void MCP2517FD_DebugVerifyTxObjectWrite(uint16_t addr, const uint8_t *exp
     (void)len;
 }
 
+/* 对外部控制器做一次硬复位。 */
 static bool CANFD1_ExtControllerReset(void)
 {
     return (DRV_CANFDSPI_Reset(MCP2517FD_MODULE_ID) == 0);
 }
 
+/* 请求控制器切到指定工作模式，并轮询直到模式稳定。 */
 static bool MCP2517FD_RequestMode(CAN_OPERATION_MODE reqMode)
 {
     uint32_t retry;
@@ -826,11 +872,13 @@ static bool MCP2517FD_RequestMode(CAN_OPERATION_MODE reqMode)
     return false;
 }
 
+/* 判断当前模式是否为期望模式。 */
 static bool MCP2517FD_IsMode(CAN_OPERATION_MODE expectedMode)
 {
     return (DRV_CANFDSPI_OperationModeGet(MCP2517FD_MODULE_ID) == expectedMode);
 }
 
+/* 历史调试接口：固定 500k 示例位时序。当前不走主路径，仅保留参考。 */
 static __attribute__((unused)) bool MCP2517FD_ConfigureBitrate500K(void)
 {
     uint32_t nbtcfg;
@@ -901,6 +949,7 @@ static bool MCP2517FD_ConfigureControllerFeatures(bool enableBrs)
     return (DRV_CANFDSPI_Configure(MCP2517FD_MODULE_ID, &config) == 0);
 }
 
+/* 根据上层配置计算并写入名义段/数据段位时序。 */
 static bool MCP2517FD_ConfigureBitTimingEx(const can_channel_config_t *config)
 {
     uint32_t nbtcfg;
@@ -939,6 +988,7 @@ static bool MCP2517FD_ConfigureBitTimingEx(const can_channel_config_t *config)
     return true;
 }
 
+/* 按当前 payload 大小配置 TXQ。 */
 static bool MCP2517FD_ConfigureTxQueueEx(uint8_t payloadSizeBytes)
 {
     CAN_TX_QUEUE_CONFIG config;
@@ -961,6 +1011,7 @@ static bool MCP2517FD_ConfigureTxQueueEx(uint8_t payloadSizeBytes)
            (DRV_CANFDSPI_TransmitChannelReset(MCP2517FD_MODULE_ID, MCP2517FD_TX_QUEUE_CHANNEL) == 0);
 }
 
+/* 配置 TEF，用于可靠获取 TX 完成事件。 */
 static bool MCP2517FD_ConfigureTxEventFifo(void)
 {
     CAN_TEF_CONFIG config;
@@ -977,6 +1028,7 @@ static bool MCP2517FD_ConfigureTxEventFifo(void)
            (DRV_CANFDSPI_TefReset(MCP2517FD_MODULE_ID) == 0);
 }
 
+/* 配置 RX FIFO，当前策略为“接收全部帧后再由上层区分来源”。 */
 static bool MCP2517FD_ConfigureRxFifo(uint8_t payloadSizeBytes)
 {
     CAN_RX_FIFO_CONFIG config;
@@ -999,6 +1051,8 @@ static bool MCP2517FD_ConfigureRxFifo(uint8_t payloadSizeBytes)
            (DRV_CANFDSPI_ReceiveChannelReset(MCP2517FD_MODULE_ID, MCP2517FD_RX_FIFO_CHANNEL) == 0);
 }
 
+/* 配置接受所有报文的过滤器。
+ * 当前工程把过滤职责放在上层，不在 CH0 驱动里提前筛掉。 */
 static bool MCP2517FD_ConfigureAcceptAllFilter(void)
 {
     CAN_FILTEROBJ_ID filterObject = {0};
@@ -1011,6 +1065,13 @@ static bool MCP2517FD_ConfigureAcceptAllFilter(void)
                 MCP2517FD_MODULE_ID, MCP2517FD_ACCEPT_ALL_FILTER, MCP2517FD_RX_FIFO_CHANNEL, true) == 0);
 }
 
+/* CH0 应用配置的内部主流程。
+ * 顺序很重要：
+ * - Reset
+ * - 配位时序/对象
+ * - 配过滤器
+ * - 切工作模式
+ * 任一步失败都应视为该次配置未成功。 */
 static bool MCP2517FD_ApplyConfigInternal(const can_channel_config_t *config)
 {
     if (config == NULL)
@@ -1076,6 +1137,7 @@ static bool MCP2517FD_ApplyConfigInternal(const can_channel_config_t *config)
     return true;
 }
 
+/* 轮询等待 TXQ 可用，避免在硬件仍忙时直接覆盖对象。 */
 static bool MCP2517FD_WaitTxQueueNotFull(void)
 {
     uint32_t retry;
@@ -1097,12 +1159,15 @@ static bool MCP2517FD_WaitTxQueueNotFull(void)
     return false;
 }
 
+/* 显式中止 TXQ。
+ * 用于错误恢复、挂死恢复，以及 TEF/TXREQ 状态不一致时的兜底清场。 */
 static void MCP2517FD_AbortTxQueue(void)
 {
     (void)DRV_CANFDSPI_TransmitChannelReset(MCP2517FD_MODULE_ID, MCP2517FD_TX_QUEUE_CHANNEL);
     MCP2517FD_ClearTxDiagnostics();
 }
 
+/* 初始化 CH0 外置控制器驱动。 */
 bool CANFD1_ExtSpiInit(void)
 {
     const uint32_t lpspiRootHz = BOARD_BOOTCLOCKRUN_LPSPI_CLK_ROOT;
@@ -1159,6 +1224,7 @@ bool CANFD1_ExtSpiInit(void)
     return true;
 }
 
+/* 对外配置入口，供 CAN Stack 调用。 */
 bool CANFD1_ExtSpiApplyConfig(const can_channel_config_t *config)
 {
     if (!s_ExtCanReady || (config == NULL))
@@ -1169,6 +1235,7 @@ bool CANFD1_ExtSpiApplyConfig(const can_channel_config_t *config)
     return MCP2517FD_ApplyConfigInternal(config);
 }
 
+/* 发送一帧，是当前 CH0 正式主路径。 */
 static bool MCP2517FD_TransmitFrame(const can_frame_t *frame)
 {
     CAN_TX_MSGOBJ txObj;
@@ -1221,6 +1288,7 @@ static bool MCP2517FD_TransmitFrame(const can_frame_t *frame)
     return true;
 }
 
+/* 历史发送路径，保留仅作对照和回退参考。 */
 static __attribute__((unused)) bool MCP2517FD_TransmitFrameLegacy(const can_frame_t *frame)
 {
     uint32_t txUa;
@@ -1285,6 +1353,7 @@ static __attribute__((unused)) bool MCP2517FD_TransmitFrameLegacy(const can_fram
     return true;
 }
 
+/* 轮询 TEF/TXREQ 等状态，生成 TX 完成或错误事件。 */
 static void MCP2517FD_PollTxEvents(void)
 {
     CAN_TEF_FIFO_EVENT tefEvents = CAN_TEF_FIFO_NO_EVENT;
@@ -1448,6 +1517,7 @@ static void MCP2517FD_PollTxEvents(void)
     }
 }
 
+/* 轮询 RX FIFO，把已收到的帧转成统一结构并上推。 */
 static void MCP2517FD_PollRxFifo(void)
 {
     CAN_RX_FIFO_EVENT rxEvents = CAN_RX_FIFO_NO_EVENT;
@@ -1523,6 +1593,8 @@ static void MCP2517FD_PollRxFifo(void)
     }
 }
 
+/* CH0 后台任务入口。
+ * 在独立任务里轮询 TX/RX/错误事件，避免把 SPI 访问散落到更多调用者。 */
 void CANFD1_ExtSpiTask(void)
 {
     can_frame_t frame;
@@ -1576,6 +1648,7 @@ void CANFD1_ExtSpiTask(void)
     ExitCritical(primask);
 }
 
+/* CH0 对外发送接口。 */
 bool CANFD1_ExtSpiSend(const can_frame_t *frame)
 {
     uint8_t nextHead;
@@ -1616,6 +1689,7 @@ bool CANFD1_ExtSpiSend(const can_frame_t *frame)
     return true;
 }
 
+/* 历史对外发送接口，当前不在主路径使用。 */
 static __attribute__((unused)) bool CANFD1_ExtSpiSendLegacyUnused(const can_frame_t *frame)
 {
     uint8_t nextHead;
@@ -1646,6 +1720,7 @@ static __attribute__((unused)) bool CANFD1_ExtSpiSendLegacyUnused(const can_fram
     return true;
 }
 
+/* 从 CH0 软件接收队列取一帧。 */
 bool CANFD1_ExtSpiReceive(can_frame_t *frame)
 {
     uint8_t tail;
@@ -1670,6 +1745,7 @@ bool CANFD1_ExtSpiReceive(can_frame_t *frame)
     return true;
 }
 
+/* 轮询 CH0 软件事件队列。 */
 bool CANFD1_ExtSpiPollEvent(can_bus_event_t *event)
 {
     uint32_t primask;
@@ -1692,6 +1768,7 @@ bool CANFD1_ExtSpiPollEvent(can_bus_event_t *event)
     return true;
 }
 
+/* 获取 CH0 运行态缓存。 */
 bool CANFD1_ExtSpiGetRuntimeState(can_driver_runtime_state_t *state)
 {
     CAN_TX_FIFO_STATUS txStatus = CAN_TX_FIFO_FULL;
@@ -1725,6 +1802,7 @@ bool CANFD1_ExtSpiGetRuntimeState(can_driver_runtime_state_t *state)
     return true;
 }
 
+/* 获取 CH0 统计信息，用于串口日志与调试。 */
 void CANFD1_ExtSpiGetStats(canfd1_ext_stats_t *stats)
 {
     uint32_t primask;

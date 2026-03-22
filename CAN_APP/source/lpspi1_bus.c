@@ -9,6 +9,10 @@
 #include "fsl_lpspi.h"
 #include "fsl_lpspi_edma.h"
 
+/* 文件说明：
+ * 本文件提供 LPSPI1 的最小可靠传输封装，专门服务于 CH0 外置 MCP2517FD。
+ * 上层驱动不直接操作 LPSPI 寄存器，而统一通过这里完成 SPI 收发。 */
+
 #define LPSPI1_CS_PORT GPIO3
 #define LPSPI1_CS_PIN (13U)
 
@@ -37,16 +41,20 @@ static void LPSPI1_MasterEdmaCallback(LPSPI_Type *base, lpspi_master_edma_handle
     s_Lpspi1TransferDone = true;
 }
 
+/* 片选拉低，开始一次外设访问。 */
 static void LPSPI1_Select(void)
 {
     GPIO_PinWrite(LPSPI1_CS_PORT, LPSPI1_CS_PIN, 0U);
 }
 
+/* 片选释放，结束一次外设访问。 */
 static void LPSPI1_Unselect(void)
 {
     GPIO_PinWrite(LPSPI1_CS_PORT, LPSPI1_CS_PIN, 1U);
 }
 
+/* 初始化 LPSPI1 + eDMA 总线层。
+ * 这是 CH0 外置 MCP2517FD 的唯一 SPI 通路。 */
 bool LPSPI1_BusInit(uint32_t srcClockHz, uint32_t busHz)
 {
     lpspi_master_config_t masterConfig;
@@ -95,6 +103,7 @@ bool LPSPI1_BusInit(uint32_t srcClockHz, uint32_t busHz)
     return true;
 }
 
+/* 执行一次 SPI 全双工传输。 */
 bool LPSPI1_Transfer(const uint8_t *txData, uint8_t *rxData, size_t length)
 {
     lpspi_transfer_t transfer;
@@ -162,22 +171,26 @@ bool LPSPI1_Transfer(const uint8_t *txData, uint8_t *rxData, size_t length)
     return true;
 }
 
+/* 查询 LPSPI1 源时钟。 */
 uint32_t LPSPI1_GetSourceClockHz(void)
 {
     return s_Lpspi1SourceClockHz;
 }
 
+/* 查询当前配置的波特率。 */
 uint32_t LPSPI1_GetConfiguredBaudHz(void)
 {
     return s_Lpspi1ConfiguredBaudHz;
 }
 
+/* DMA 中断入口。 */
 void DMA0_DMA16_IRQHandler(void)
 {
     EDMA_HandleIRQ(&s_Lpspi1EdmaRxHandle);
     __DSB();
 }
 
+/* DMA 中断入口。 */
 void DMA1_DMA17_IRQHandler(void)
 {
     EDMA_HandleIRQ(&s_Lpspi1EdmaTxHandle);
